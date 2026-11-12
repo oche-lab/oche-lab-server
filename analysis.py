@@ -213,7 +213,27 @@ def summarise_throw(rows, indices, number, peak_index=None, wrist_speed=None):
             'head_motion_relative_normalized': _spread(head),
             'elbow_motion_normalized': _spread(elbow),
             'wrist_motion_normalized': _spread(wrist),
-            'valid_frames': len(angles)}
+            'valid_frames': len(angles),
+            'path': throw_path(subset)}
+
+
+def _pt(p):
+    return None if p is None else [round(float(p[0]), 4), round(float(p[1]), 4)]
+
+
+def throw_path(subset):
+    """Compact per-frame arm path for one throw window (normalised image coords, y down).
+
+    Lets the app draw the wrist path and compare upper-arm angle / release height between throws.
+    Each item: t (s), s/e/w = shoulder/elbow/wrist [x, y] or None, a = elbow angle (deg) or None.
+    """
+    out = []
+    for r in subset:
+        pts = r['points']
+        a = r.get('elbow_angle_deg')
+        out.append({'t': r['time_s'], 's': _pt(pts.get('shoulder')), 'e': _pt(pts.get('elbow')),
+                    'w': _pt(pts.get('wrist')), 'a': None if a is None else round(float(a), 1)})
+    return out
 
 
 def _others_median(throws, i, key):
