@@ -39,8 +39,22 @@ def _panel(img, y0, y1, alpha=0.65):
     img[y0:y1] = cv2.addWeighted(roi, 1 - alpha, np.full_like(roi, PANEL), alpha, 0)
 
 
-def draw_overlay(frame, points, elbow_angle=None, label=None, caption=None, time_s=None):
-    """Draw tracked arm, head/shoulder lines, elbow angle, header label and caption. Returns a new image."""
+def _chip(img, text, x, y, s, th, fill=PANEL, fg=WHITE):
+    """Draw a left-aligned HUD chip; returns the next x."""
+    font, scale = cv2.FONT_HERSHEY_SIMPLEX, 0.62 * s
+    (tw, tht), _ = cv2.getTextSize(text, font, scale, max(1, th - 1))
+    pad, hpad = int(6 * s), int(8 * s)
+    cv2.rectangle(img, (x, y), (x + tw + 2 * hpad, y + tht + 2 * pad), fill, -1, cv2.LINE_AA)
+    cv2.putText(img, text, (x + hpad, y + pad + tht), font, scale, fg, max(1, th - 1), cv2.LINE_AA)
+    return x + tw + 2 * hpad + int(8 * s)
+
+
+def draw_overlay(frame, points, elbow_angle=None, label=None, caption=None, time_s=None, badge=None):
+    """Draw tracked arm, head/shoulder lines, elbow angle, header, optional HUD badge and caption.
+
+    badge: extra chip such as 'Release 120 deg', shown next to the elbow-angle chip so release
+    and follow-through angles stay readable even when the joint label is tucked off-frame.
+    """
     img = frame.copy()
     h, w = img.shape[:2]
     s = max(0.6, min(w, h) / 540)  # scale strokes/text with resolution
@@ -62,6 +76,7 @@ def draw_overlay(frame, points, elbow_angle=None, label=None, caption=None, time
         org = (P['elbow'][0] + int(12 * s), P['elbow'][1] - int(12 * s))
         cv2.putText(img, txt, org, cv2.FONT_HERSHEY_SIMPLEX, 0.8 * s, (0, 0, 0), th + 2, cv2.LINE_AA)
         cv2.putText(img, txt, org, cv2.FONT_HERSHEY_SIMPLEX, 0.8 * s, WHITE, max(1, th - 1), cv2.LINE_AA)
+    bar = 0
     if label or time_s is not None:
         bar = int(44 * s)
         _panel(img, 0, bar)
@@ -71,6 +86,15 @@ def draw_overlay(frame, points, elbow_angle=None, label=None, caption=None, time
             t = f'{time_s:.2f}s'
             (tw, _), _ = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.7 * s, 1)
             cv2.putText(img, t, (w - tw - int(12 * s), int(30 * s)), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * s, (200, 220, 230), 1, cv2.LINE_AA)
+    chips = []
+    if elbow_angle is not None:
+        chips.append((f'Elbow {elbow_angle:.0f} deg', PANEL, WHITE))
+    if badge:
+        chips.append((_ascii(badge), (40, 140, 40) if 'Release' in badge else PANEL, WHITE))
+    if chips:
+        x, y = int(12 * s), bar + int(8 * s)
+        for text, fill, fg in chips:
+            x = _chip(img, text, x, y, s, th, fill, fg)
     if caption:
         chars = max(20, int(w / (11 * s)))
         lines = textwrap.wrap(_ascii(caption), chars)[:3]
@@ -119,9 +143,28 @@ def render_key_frames(video_path, requests, out_dir):
     return written
 
 
+def _window_at(windows, t):
+    """windows: (throw_no, start_s, end_s) or (throw_no, start_s, end_s, peak_s)."""
+    for w in windows:
+        n, a, b = w[0], w[1], w[2]
+        if a <= t <= b:
+            return n, a, b, (w[3] if len(w) > 3 else None)
+    return None, None, None, None
+
+
+def _phase_at(t, start, end, peak):
+    if peak is None:
+        return None
+    if abs(t - peak) <= 0.18:
+        return 'Release'
+    if t < peak:
+        return 'Take-back' if t >= (start + peak) / 2 else 'Set-up'
+    return 'Follow-through'
+
+
 def render_overlay_video(video_path, rows, windows, out_path):
     """Annotated MP4 of the clip (first OVERLAY_MAX_SECONDS). rows need 'frame_idx', 'time_s', 'points',
-    'elbow_angle_deg'; windows: [(throw_no, start_s, end_s)]. Returns out_path or None if no H.264 encoder."""
+    'elbow_angle_deg'; windows: [(throw_no, start_s, end_s[, peak_s])]. Returns out_path or None if no H.264 encoder."""
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     ok, frame = cap.read()
@@ -155,9 +198,12 @@ def render_overlay_video(video_path, rows, windows, out_path):
                 j += 1
             r = rows[j]
             t = idx / fps
-            active = next((n for n, a, b in windows if a <= t <= b), None)
-            img = draw_overlay(_fit(frame, OVERLAY_MAX_SIDE), r['points'], r['elbow_angle_deg'],
-                               f'Throw {active}' if active else 'Oche Lab', None, t)
+            n, start, end, peak = _window_at(windows, t)
+            phase = _phase_at(t, start, end, peak) if n is not None else None
+            label = f'Throw {n} - {phase}' if n is not None and phase else (f'Throw {n}' if n is not None else 'Oche Lab')
+            ang = r.get('elbow_angle_deg')
+            badge = f'Release {ang:.0f} deg' if phase == 'Release' and ang is not None else None
+            img = draw_overlay(_fit(frame, OVERLAY_MAX_SIDE), r['points'], ang, label, None, t, badge)
             if img.shape[1] != size[0] or img.shape[0] != size[1]:
                 img = cv2.resize(img, size)
             writer.write(img)

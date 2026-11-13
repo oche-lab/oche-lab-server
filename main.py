@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse
 from analysis import TIPS_NOTE, build_review, segment_throws, session_tips, summarise_throw, throw_tips
 from annotate import render_key_frames, render_overlay_video
 
-VERSION = '0.6.0'
+VERSION = '0.6.1'
 
 app = FastAPI(title='Oche Lab Motion API', version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])  # local prototype only
@@ -172,7 +172,7 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None):
     overlay_url, overlay_note = None, None
     if overlay:
         try:
-            done = render_overlay_video(path, rows, [(t['throw'], t['start_s'], t['end_s']) for t in summaries],
+            done = render_overlay_video(path, rows, [(t['throw'], t['start_s'], t['end_s'], t.get('peak_time_s')) for t in summaries],
                                         out_dir / 'overlay.mp4')
         except Exception:
             done = None
