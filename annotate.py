@@ -18,11 +18,11 @@ OVERLAY_CODECS = ('avc1', 'H264')  # iOS needs H.264. Fallback: write mp4v, then
 FFMPEG_TIMEOUT_S = 90
 
 # BGR colours
-ARM = (94, 197, 34)        # green: shoulder-elbow-wrist
+ARM = (61, 31, 255)        # neon red (BGR #FF1F3D): shoulder-elbow-wrist
 HEAD = (11, 158, 245)      # amber: head-shoulder line
-SHOULDERS = (250, 165, 96)  # light blue: shoulder line
+SHOULDERS = (215, 210, 210)  # off-white: shoulder line
 WHITE = (255, 255, 255)
-PANEL = (32, 18, 11)
+PANEL = (14, 12, 12)       # matte black HUD panels
 
 
 def _ascii(text):
@@ -90,7 +90,7 @@ def draw_overlay(frame, points, elbow_angle=None, label=None, caption=None, time
     if elbow_angle is not None:
         chips.append((f'Elbow {elbow_angle:.0f} deg', PANEL, WHITE))
     if badge:
-        chips.append((_ascii(badge), (40, 140, 40) if 'Release' in badge else PANEL, WHITE))
+        chips.append((_ascii(badge), (45, 15, 200) if 'Release' in badge else PANEL, WHITE))
     if chips:
         x, y = int(12 * s), bar + int(8 * s)
         for text, fill, fg in chips:

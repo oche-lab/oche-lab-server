@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse
 from analysis import TIPS_NOTE, build_review, segment_throws, session_tips, summarise_throw, throw_tips
 from annotate import render_key_frames, render_overlay_video
 
-VERSION = '0.6.1'
+VERSION = '0.6.2'
 
 app = FastAPI(title='Oche Lab Motion API', version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])  # local prototype only
