@@ -25,6 +25,54 @@ WHITE = (255, 255, 255)
 PANEL = (14, 12, 12)       # matte black HUD panels
 
 
+# ---- Upright frames ------------------------------------------------------------------------------------
+# iPhones store portrait video as landscape pixels plus a rotation tag. OpenCV's pip builds don't apply the
+# tag by default, so pose detection, key frames and the overlay film all came out sideways. Every reader
+# goes through open_video()/upright(): auto-rotation is switched off and the tag is applied explicitly, so the
+# result is the same on any OpenCV build. The overlay MP4 is written from upright pixels with no rotation tag.
+_ROTATE = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+
+
+def _ffprobe_rotation(path):
+    """Display rotation from the stream side data (ffprobe convention: + = counter-clockwise), or 0."""
+    if not shutil.which('ffprobe'):
+        return 0
+    try:
+        out = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                              'stream_side_data=rotation:stream_tags=rotate', '-of', 'default=nw=1:nk=1', str(path)],
+                             capture_output=True, text=True, timeout=15).stdout
+        vals = [float(v) for v in out.split() if v.strip().lstrip('-').replace('.', '', 1).isdigit()]
+        return int(round(vals[0])) if vals else 0
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return 0
+
+
+def video_rotation(cap, path=None):
+    """Clockwise degrees (0/90/180/270) needed to make this capture's frames upright."""
+    rot = 0
+    try:
+        cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+        if cap.get(cv2.CAP_PROP_ORIENTATION_AUTO):  # this build insists on rotating itself: nothing to add
+            return 0
+        rot = int(round(cap.get(cv2.CAP_PROP_ORIENTATION_META) or 0))
+    except Exception:  # very old OpenCV without the orientation properties
+        rot = 0
+    if rot % 360 == 0 and path is not None:
+        rot = -_ffprobe_rotation(path)  # tag says counter-clockwise; we rotate clockwise
+    rot %= 360
+    return rot if rot in _ROTATE else 0
+
+
+def open_video(path):
+    """cv2.VideoCapture plus the clockwise rotation that makes its frames upright."""
+    cap = cv2.VideoCapture(str(path))
+    return cap, video_rotation(cap, path)
+
+
+def upright(frame, rot):
+    return cv2.rotate(frame, _ROTATE[rot]) if rot in _ROTATE else frame
+
+
 def _ascii(text):
     return (text or '').replace('°', ' deg').replace('–', '-').replace('’', "'").encode('ascii', 'ignore').decode()
 
@@ -145,12 +193,18 @@ def render_key_frames(video_path, requests, out_dir):
     if not wanted:
         return written
     last = max(wanted)
-    cap = cv2.VideoCapture(str(video_path))
+    cap, rot = open_video(video_path)
     try:
         while idx <= last:
+            if idx not in wanted:  # skip decoding-to-BGR of frames we don't draw
+                if not cap.grab():
+                    break
+                idx += 1
+                continue
             ok, frame = cap.read()
             if not ok:
                 break
+            frame = upright(frame, rot)
             for r in wanted.get(idx, []):
                 img = draw_overlay(_fit(frame, FRAME_MAX_SIDE), r['points'], r.get('elbow_angle_deg'),
                                    r.get('label'), r.get('caption'), r.get('time_s'), None, r.get('view', 'side'), r.get('body'))
@@ -184,12 +238,13 @@ def _phase_at(t, start, end, peak):
 def render_overlay_video(video_path, rows, windows, out_path, view='side', body=None):
     """Annotated MP4 of the clip (first OVERLAY_MAX_SECONDS). rows need 'frame_idx', 'time_s', 'points',
     'elbow_angle_deg'; windows: [(throw_no, start_s, end_s[, peak_s])]. Returns out_path or None if no H.264 encoder."""
-    cap = cv2.VideoCapture(str(video_path))
+    cap, rot = open_video(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     ok, frame = cap.read()
     if not ok:
         cap.release()
         return None
+    frame = upright(frame, rot)
     first = _fit(frame, OVERLAY_MAX_SIDE)
     size = (first.shape[1], first.shape[0])
     out_path = Path(out_path)
@@ -231,6 +286,8 @@ def render_overlay_video(video_path, rows, windows, out_path, view='side', body=
                 img = cv2.resize(img, size)
             writer.write(img)
             ok, frame = cap.read()
+            if ok:
+                frame = upright(frame, rot)
             idx += 1
     finally:
         writer.release()
@@ -238,7 +295,7 @@ def render_overlay_video(video_path, rows, windows, out_path, view='side', body=
     if transcode:
         try:
             subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', str(target), '-c:v', 'libx264', '-preset', 'veryfast',
-                            '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', str(out_path)],
+                            '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', '-metadata:s:v:0', 'rotate=0', str(out_path)],
                            check=True, timeout=FFMPEG_TIMEOUT_S, capture_output=True)
         except (subprocess.SubprocessError, OSError):
             out_path.unlink(missing_ok=True)

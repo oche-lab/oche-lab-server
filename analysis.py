@@ -10,7 +10,8 @@ import numpy as np
 MAX_GAP_S = 0.35             # interpolate missing landmarks over gaps up to this long
 SMOOTH_FRAMES = 3            # centred moving-average window for positions/angles
 ELBOW_WEIGHT = 0.5           # contribution of elbow-angle velocity to the detection signal
-PEAK_MIN_SEPARATION_S = 0.6  # two peaks closer than this are treated as one throw
+PEAK_MIN_SEPARATION_S = 1.2  # two peaks closer than this are one throw (take-back + release); real throws are 2 s+ apart
+PEAK_HYST_LOW_FRAC = 0.5     # hysteresis: a burst only ends once the signal drops below this fraction of the threshold
 PEAK_MAD_K = 4.0             # adaptive threshold = median + k * (1.4826 * MAD)
 PEAK_MIN_WRIST_SPEED = 0.25  # absolute floor, normalised image units / second
 PEAK_MAX_FRAC = 0.5          # threshold never above this fraction of the tallest peak (busy clips)
@@ -18,7 +19,10 @@ PEAK_MIN_REL_HEIGHT = 0.4    # ignore peaks smaller than this fraction of the ta
 WINDOW_BEFORE_S = 0.7        # window starts this long before the peak...
 WINDOW_AFTER_S = 0.4         # ...and ends this long after it
 MIN_WINDOW_FRAMES = 4        # drop windows with fewer sampled frames than this
-MAX_THROWS = 6
+MAX_THROWS = 15             # hard cap; the app also sends max_throws (darts on board photos / 3 per visit)
+EXT_WINDOW_S = 0.35          # side-on: look this far either side of a peak for the arm extending forward...
+EXT_MIN_ELBOW_DEG = 15       # ...elbow opening by at least this much...
+EXT_MIN_REACH = 0.25         # ...or wrist moving away from the shoulder by this fraction of upper-arm length
 MIN_VALID_SIGNAL_PCT = 0.5   # need wrist coverage on at least half the frames to try auto
 FALLBACK_WINDOWS = 3
 
@@ -118,13 +122,28 @@ def adaptive_threshold(signal, k=PEAK_MAD_K, floor=PEAK_MIN_WRIST_SPEED):
     return max(min(med + k * mad, PEAK_MAX_FRAC * float(np.max(s))), floor)
 
 
-def find_peaks(signal, times, threshold, min_sep_s=PEAK_MIN_SEPARATION_S):
-    """Local maxima above threshold, greedily keeping the tallest within min_sep_s."""
+def find_peaks(signal, times, threshold, min_sep_s=PEAK_MIN_SEPARATION_S, low_frac=PEAK_HYST_LOW_FRAC):
+    """One peak per motion burst, greedily keeping the tallest within min_sep_s.
+
+    Hysteresis: a burst starts when the signal reaches `threshold` and only ends once it falls below
+    low_frac * threshold, so the wobbles of a single throw (take-back, release, follow-through) can't
+    count twice by dipping just under the threshold. Each burst contributes its tallest sample.
+    """
     s = np.asarray(signal, dtype=float)
     t = np.asarray(times, dtype=float)
     if len(s) < 3:
         return []
-    cand = [i for i in range(1, len(s) - 1) if s[i] >= threshold and s[i] >= s[i - 1] and s[i] > s[i + 1]]
+    low = low_frac * threshold
+    cand, i = [], 0
+    while i < len(s):
+        if s[i] >= threshold:
+            j = i
+            while j + 1 < len(s) and s[j + 1] >= low:
+                j += 1
+            cand.append(i + int(np.argmax(s[i:j + 1])))
+            i = j + 1
+        else:
+            i += 1
     if cand:
         tallest = max(s[i] for i in cand)
         cand = [i for i in cand if s[i] >= PEAK_MIN_REL_HEIGHT * tallest]
@@ -152,10 +171,50 @@ def windows_around_peaks(peaks, times, before_s=WINDOW_BEFORE_S, after_s=WINDOW_
     return out
 
 
-def segment_throws(rows):
+def _window_extreme(values, t, lo, hi, fn):
+    m = (t >= lo) & (t <= hi) & ~np.isnan(values)
+    return float(fn(values[m])) if m.any() else None
+
+
+def forward_extension(rows, times, peak):
+    """(elbow opening deg, wrist reach / upper-arm length) around a peak; None where not measurable.
+
+    Before = smallest value in the EXT_WINDOW_S before the peak, after = largest value in the window after.
+    A release opens the elbow and pushes the wrist away from the shoulder; a take-back or a reach for
+    the next dart doesn't.
+    """
+    t = np.asarray(times, dtype=float)
+    lo, mid, hi = t[peak] - EXT_WINDOW_S, t[peak], t[peak] + EXT_WINDOW_S
+    ang = smooth(interpolate_gaps(np.array([np.nan if r.get('elbow_angle_deg') is None else r['elbow_angle_deg']
+                                            for r in rows], dtype=float), t))
+    open_deg = None
+    b, a = _window_extreme(ang, t, lo, mid, np.min), _window_extreme(ang, t, mid, hi, np.max)
+    if b is not None and a is not None:
+        open_deg = a - b
+    sh, el, wr = (_series([r['points'].get(k) for r in rows]) for k in ('shoulder', 'elbow', 'wrist'))
+    upper = np.nanmedian(np.linalg.norm(el - sh, axis=1)) if np.isfinite(el - sh).any() else np.nan
+    reach = None
+    if np.isfinite(upper) and upper > 1e-6:
+        d = smooth(interpolate_gaps(np.linalg.norm(wr - sh, axis=1), t)) / upper
+        b, a = _window_extreme(d, t, lo, mid, np.min), _window_extreme(d, t, mid, hi, np.max)
+        if b is not None and a is not None:
+            reach = a - b
+    return open_deg, reach
+
+
+def is_forward_throw(rows, times, peak):
+    open_deg, reach = forward_extension(rows, times, peak)
+    if open_deg is None and reach is None:
+        return True  # can't tell: don't throw the peak away
+    return (open_deg is not None and open_deg >= EXT_MIN_ELBOW_DEG) or (reach is not None and reach >= EXT_MIN_REACH)
+
+
+def segment_throws(rows, view='side', max_throws=None):
     """Detect throws from wrist/elbow motion. Falls back to equal windows if detection fails.
 
     rows: dicts with 'time_s', 'points' {'wrist','elbow',...}, 'elbow_angle_deg'.
+    view: 'side' also requires a forward arm extension at each peak (front-on 2D angles can't show it).
+    max_throws: optional cap from the app (darts marked on board photos, or 3 per visit).
     Returns dict: method, sentence, segments [{'indices', 'peak_index'|None}], wrist_speed.
     """
     times = [r['time_s'] for r in rows]
@@ -171,8 +230,12 @@ def segment_throws(rows):
         sig = detection_signal(wrist_speed, elbow_speed)
         thr = adaptive_threshold(sig)
         peaks = find_peaks(sig, times, thr)
-        if len(peaks) > MAX_THROWS:
-            peaks = sorted(sorted(peaks, key=lambda i: -sig[i])[:MAX_THROWS])
+        if view != 'front' and peaks:
+            forward = [p for p in peaks if is_forward_throw(rows, times, p)]
+            peaks = forward or peaks  # if nothing passes, tracking is too rough to judge: keep the motion peaks
+        cap = MAX_THROWS if not max_throws else max(1, min(int(max_throws), MAX_THROWS))
+        if len(peaks) > cap:
+            peaks = sorted(sorted(peaks, key=lambda i: -sig[i])[:cap])
         wins = windows_around_peaks(peaks, times)
         if wins:
             n = len(wins)

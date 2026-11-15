@@ -18,9 +18,9 @@ from fastapi.responses import FileResponse
 
 from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_session_tips, front_throw_tips,
                       pick_phases, segment_throws, session_tips, summarise_throw, throw_tips)
-from annotate import render_key_frames, render_overlay_video
+from annotate import open_video, render_key_frames, render_overlay_video, upright
 
-VERSION = '0.7.0'
+VERSION = '0.7.1'
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
 
 app = FastAPI(title='Oche Lab Motion API', version=VERSION)
@@ -79,7 +79,7 @@ def extract_rows(path, arm='right'):
     """Run MediaPipe Pose on sampled frames. Returns (rows, fps). Heavy imports stay local."""
     import mediapipe as mp
     keys = ARM_KEYS[arm]
-    cap = cv2.VideoCapture(str(path))
+    cap, rot = open_video(path)  # portrait phone clips: rotate to upright before pose detection
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if count < 15:
@@ -104,6 +104,7 @@ def extract_rows(path, arm='right'):
             ok, frame = cap.read()
             if not ok:
                 break
+            frame = upright(frame, rot)
             h, w = frame.shape[:2]
             if max(h, w) > MAX_POSE_DIM:
                 scale = MAX_POSE_DIM / max(h, w)
@@ -133,7 +134,7 @@ def make_row(frame_idx, fps, coords):
             'elbow_angle_deg': angle(shoulder, elbow, wrist), 'head_relative': head_relative}
 
 
-def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, view='side'):
+def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, view='side', max_throws=None):
     """Segment throws, compute metrics/tips, render annotated key frames (+ optional overlay MP4)."""
     if len(rows) < 15:
         raise ValueError('Not enough video frames could be analysed.')
@@ -142,7 +143,7 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
         raise ValueError('Throwing arm not visible enough. ' + ('Film from beside the board at eye height with your whole upper body in frame.'
                          if view == 'front' else 'Use a fixed side-on camera and good lighting.'))
     # Automatic throw detection from wrist/elbow speed peaks; equal thirds only as a fallback.
-    seg = segment_throws(rows)
+    seg = segment_throws(rows, view=view, max_throws=max_throws)
     summaries = [summarise_throw(rows, sg['indices'], i+1, sg['peak_index'], seg['wrist_speed'])
                  for i, sg in enumerate(seg['segments'])]
     frame = body_frame(rows) if view == 'front' else None
@@ -207,9 +208,9 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
                           for r in rows[::max(1,len(rows)//120)]]}
 
 
-def analyse(path, arm='right', overlay=False, view='side'):
+def analyse(path, arm='right', overlay=False, view='side', max_throws=None):
     rows, fps = extract_rows(path, arm)
-    return build_result(path, rows, fps, arm, overlay, view=view)
+    return build_result(path, rows, fps, arm, overlay, view=view, max_throws=max_throws)
 
 
 @app.get('/health')
@@ -248,10 +249,10 @@ def _set_job(job_id, **fields):
         JOBS.setdefault(job_id, {}).update(fields, updated=time.time())
 
 
-def _run_job(job_id, path, arm, overlay, view='side'):
+def _run_job(job_id, path, arm, overlay, view='side', max_throws=None):
     _set_job(job_id, status='running')
     try:
-        _set_job(job_id, status='done', result=analyse(path, arm, overlay, view))
+        _set_job(job_id, status='done', result=analyse(path, arm, overlay, view, max_throws))
     except ValueError as e:
         _set_job(job_id, status='error', error=str(e))
     except Exception as e:  # pragma: no cover - surfaced to the app as a readable message
@@ -294,20 +295,21 @@ async def _save_upload(video, arm):
 
 @app.post('/analyse')
 async def analyse_video(video: UploadFile = File(...), arm: str = Form('right'), overlay: bool = Form(False),
-                        mode: str = Form('sync'), view: str = Form('side')):
+                        mode: str = Form('sync'), view: str = Form('side'), max_throws: int = Form(0)):
     view = (view or 'side').strip().lower()
     if view not in VIEWS:
         raise HTTPException(400, "view must be 'side' or 'front'.")
+    max_throws = max_throws if 0 < max_throws <= 60 else None  # app sends darts marked on board photos / 3 per visit
     path, arm = await _save_upload(video, arm)
     cleanup_results()
     if mode == 'job':
         _prune_jobs()
         job_id = uuid.uuid4().hex
         _set_job(job_id, status='queued')
-        EXECUTOR.submit(_run_job, job_id, path, arm, overlay, view)
+        EXECUTOR.submit(_run_job, job_id, path, arm, overlay, view, max_throws)
         return {'job_id': job_id, 'status': 'queued'}
     try:
-        return await run_in_threadpool(analyse, path, arm, overlay, view)
+        return await run_in_threadpool(analyse, path, arm, overlay, view, max_throws)
     except ValueError as e:
         raise HTTPException(422, str(e))
     finally:
