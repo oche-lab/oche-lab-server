@@ -1,4 +1,4 @@
-"""Oche Lab experimental side-view motion tracker. Not a validated biomechanics device."""
+"""Oche Lab experimental motion tracker (side-on or front-on camera). Not a validated biomechanics device."""
 import os
 import re
 import shutil
@@ -16,10 +16,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from analysis import TIPS_NOTE, build_review, segment_throws, session_tips, summarise_throw, throw_tips
+from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_session_tips, front_throw_tips,
+                      pick_phases, segment_throws, session_tips, summarise_throw, throw_tips)
 from annotate import render_key_frames, render_overlay_video
 
-VERSION = '0.6.2'
+VERSION = '0.7.0'
+VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
 
 app = FastAPI(title='Oche Lab Motion API', version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])  # local prototype only
@@ -131,29 +133,38 @@ def make_row(frame_idx, fps, coords):
             'elbow_angle_deg': angle(shoulder, elbow, wrist), 'head_relative': head_relative}
 
 
-def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None):
+def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, view='side'):
     """Segment throws, compute metrics/tips, render annotated key frames (+ optional overlay MP4)."""
     if len(rows) < 15:
         raise ValueError('Not enough video frames could be analysed.')
     detected = sum(r['points']['elbow'] is not None and r['points']['wrist'] is not None for r in rows)
     if detected / len(rows) < 0.55:
-        raise ValueError('Throwing arm not visible enough. Use a fixed side-on camera and good lighting.')
+        raise ValueError('Throwing arm not visible enough. ' + ('Film from beside the board at eye height with your whole upper body in frame.'
+                         if view == 'front' else 'Use a fixed side-on camera and good lighting.'))
     # Automatic throw detection from wrist/elbow speed peaks; equal thirds only as a fallback.
     seg = segment_throws(rows)
     summaries = [summarise_throw(rows, sg['indices'], i+1, sg['peak_index'], seg['wrist_speed'])
                  for i, sg in enumerate(seg['segments'])]
-    for t, tips in zip(summaries, throw_tips(summaries)):
+    frame = body_frame(rows) if view == 'front' else None
+    if view == 'front':  # sideways alignment/sway metrics; side-on-only elbow metrics stay in but are flagged n/a
+        for t, sg in zip(summaries, seg['segments']):
+            t.update(front_metrics(rows, sg['indices'], pick_phases(rows, sg['indices'], sg['peak_index'], seg['wrist_speed']), frame))
+    for t, tips in zip(summaries, (front_throw_tips if view == 'front' else throw_tips)(summaries)):
         t['tips'] = tips
+    if view == 'front':  # elbow angles are foreshortened from the front: not reported
+        for t in summaries:
+            t['elbow_angle_mean_deg'] = t['elbow_angle_range_deg'] = None
     arm_pct = round(100*detected/len(rows), 1)
 
     analysis_id = analysis_id or uuid.uuid4().hex
     out_dir = RESULTS_ROOT / analysis_id
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = f'/analysis/{analysis_id}/frames/'
-    key_frames, timeline = build_review(rows, seg['segments'], summaries, seg['wrist_speed'], prefix)
+    key_frames, timeline = build_review(rows, seg['segments'], summaries, seg['wrist_speed'], prefix, view)
     requests = [{'frame_idx': rows[kf['row_index']]['frame_idx'], 'name': kf['frame'],
                  'points': rows[kf['row_index']]['points'], 'elbow_angle_deg': kf['elbow_angle_deg'],
-                 'label': f"Throw {t['throw']} - {kf['label']}", 'caption': kf['caption'], 'time_s': kf['time_s']}
+                 'label': f"Throw {t['throw']} - {kf['label']}", 'caption': kf['caption'], 'time_s': kf['time_s'],
+                 'view': view, 'body': frame}
                 for t, frames in zip(summaries, key_frames) for kf in frames]
     try:
         written = render_key_frames(path, requests, out_dir)
@@ -173,7 +184,7 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None):
     if overlay:
         try:
             done = render_overlay_video(path, rows, [(t['throw'], t['start_s'], t['end_s'], t.get('peak_time_s')) for t in summaries],
-                                        out_dir / 'overlay.mp4')
+                                        out_dir / 'overlay.mp4', view=view, body=frame)
         except Exception:
             done = None
         overlay_url = f'/analysis/{analysis_id}/overlay.mp4' if done else None
@@ -183,22 +194,27 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None):
             'arm':arm, 'fps_source':round(fps,2), 'sampled_frames':len(rows),
             'arm_detected_pct':arm_pct,
             'segmentation_method':seg['method'], 'segmentation':seg['sentence'],
-            'session_tips':session_tips(summaries, seg['method'], arm_pct), 'tips_note':TIPS_NOTE,
-            'measurement_note':'2D normalized image coordinates; camera perspective and body size affect values. Not validated as coaching advice.',
+            'view':view,
+            'session_tips':(front_session_tips if view == 'front' else session_tips)(summaries, seg['method'], arm_pct),
+            'tips_note':TIPS_NOTE,
+            'measurement_note':('Front-on: sideways offsets are in shoulder widths (+ = out from the body); elbow drop and '
+                                'elbow/release angles are side-on measurements and are not reported. ' if view == 'front' else '')
+                               + '2D normalized image coordinates; camera perspective and body size affect values. Not validated as coaching advice.',
+            'not_measured':(['elbow_drop', 'release_angle', 'follow_through_angle'] if view == 'front' else []),
             'throws':summaries, 'timeline':timeline, 'overlay_url':overlay_url, 'overlay_note':overlay_note,
             'trajectory':[{'time_s':r['time_s'], 'head':r['points']['head'], 'elbow':r['points']['elbow'],
                            'wrist':r['points']['wrist'], 'elbow_angle_deg':r['elbow_angle_deg']}
                           for r in rows[::max(1,len(rows)//120)]]}
 
 
-def analyse(path, arm='right', overlay=False):
+def analyse(path, arm='right', overlay=False, view='side'):
     rows, fps = extract_rows(path, arm)
-    return build_result(path, rows, fps, arm, overlay)
+    return build_result(path, rows, fps, arm, overlay, view=view)
 
 
 @app.get('/health')
 def health():
-    return {'ok':True, 'version':VERSION}
+    return {'ok':True, 'version':VERSION, 'views':list(VIEWS)}
 
 
 @app.get('/analysis/{analysis_id}/frames/{name}')
@@ -232,10 +248,10 @@ def _set_job(job_id, **fields):
         JOBS.setdefault(job_id, {}).update(fields, updated=time.time())
 
 
-def _run_job(job_id, path, arm, overlay):
+def _run_job(job_id, path, arm, overlay, view='side'):
     _set_job(job_id, status='running')
     try:
-        _set_job(job_id, status='done', result=analyse(path, arm, overlay))
+        _set_job(job_id, status='done', result=analyse(path, arm, overlay, view))
     except ValueError as e:
         _set_job(job_id, status='error', error=str(e))
     except Exception as e:  # pragma: no cover - surfaced to the app as a readable message
@@ -278,17 +294,20 @@ async def _save_upload(video, arm):
 
 @app.post('/analyse')
 async def analyse_video(video: UploadFile = File(...), arm: str = Form('right'), overlay: bool = Form(False),
-                        mode: str = Form('sync')):
+                        mode: str = Form('sync'), view: str = Form('side')):
+    view = (view or 'side').strip().lower()
+    if view not in VIEWS:
+        raise HTTPException(400, "view must be 'side' or 'front'.")
     path, arm = await _save_upload(video, arm)
     cleanup_results()
     if mode == 'job':
         _prune_jobs()
         job_id = uuid.uuid4().hex
         _set_job(job_id, status='queued')
-        EXECUTOR.submit(_run_job, job_id, path, arm, overlay)
+        EXECUTOR.submit(_run_job, job_id, path, arm, overlay, view)
         return {'job_id': job_id, 'status': 'queued'}
     try:
-        return await run_in_threadpool(analyse, path, arm, overlay)
+        return await run_in_threadpool(analyse, path, arm, overlay, view)
     except ValueError as e:
         raise HTTPException(422, str(e))
     finally:

@@ -49,17 +49,26 @@ def _chip(img, text, x, y, s, th, fill=PANEL, fg=WHITE):
     return x + tw + 2 * hpad + int(8 * s)
 
 
-def draw_overlay(frame, points, elbow_angle=None, label=None, caption=None, time_s=None, badge=None):
+def draw_overlay(frame, points, elbow_angle=None, label=None, caption=None, time_s=None, badge=None, view='side', body=None):
     """Draw tracked arm, head/shoulder lines, elbow angle, header, optional HUD badge and caption.
 
     badge: extra chip such as 'Release 120 deg', shown next to the elbow-angle chip so release
     and follow-through angles stay readable even when the joint label is tucked off-frame.
+    view='front': draws the vertical shoulder line the arm should stay on and reports the hand's sideways
+    offset from it (body = (shoulder_width, outward_sign)) instead of the foreshortened elbow angle.
     """
     img = frame.copy()
     h, w = img.shape[:2]
     s = max(0.6, min(w, h) / 540)  # scale strokes/text with resolution
     th = max(2, int(3 * s))
     P = {k: _px(points.get(k), w, h) for k in ('head', 'shoulder', 'elbow', 'wrist', 'other_shoulder')}
+    front = view == 'front'
+    if front:
+        elbow_angle = None
+        if P['shoulder']:  # dashed vertical "line of the throw" through the throwing shoulder
+            x = P['shoulder'][0]
+            for y in range(0, h, int(18 * s)):
+                cv2.line(img, (x, y), (x, min(h, y + int(10 * s))), HEAD, max(1, th - 1), cv2.LINE_AA)
     if P['shoulder'] and P['other_shoulder']:
         cv2.line(img, P['other_shoulder'], P['shoulder'], SHOULDERS, th, cv2.LINE_AA)
     if P['head'] and P['shoulder']:
@@ -87,6 +96,9 @@ def draw_overlay(frame, points, elbow_angle=None, label=None, caption=None, time
             (tw, _), _ = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.7 * s, 1)
             cv2.putText(img, t, (w - tw - int(12 * s), int(30 * s)), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * s, (200, 220, 230), 1, cv2.LINE_AA)
     chips = []
+    off = front_offset(points, body) if front else None
+    if off is not None:
+        chips.append((f"Hand {abs(off) * 100:.0f}% {'out' if off > 0 else 'in'}", PANEL, WHITE))
     if elbow_angle is not None:
         chips.append((f'Elbow {elbow_angle:.0f} deg', PANEL, WHITE))
     if badge:
@@ -105,6 +117,13 @@ def draw_overlay(frame, points, elbow_angle=None, label=None, caption=None, time
             cv2.putText(img, line, (int(12 * s), top + int(8 * s) + lh * (k + 1) - int(6 * s)), cv2.FONT_HERSHEY_SIMPLEX,
                         0.62 * s, WHITE, max(1, th - 2), cv2.LINE_AA)
     return img
+
+
+def front_offset(points, body):
+    """Wrist offset from the shoulder's vertical line in shoulder widths (+ = outward), or None."""
+    if not body or not body[0] or not points.get('wrist') or not points.get('shoulder'):
+        return None
+    return (points['wrist'][0] - points['shoulder'][0]) * body[1] / body[0]
 
 
 def _fit(img, max_side):
@@ -134,7 +153,7 @@ def render_key_frames(video_path, requests, out_dir):
                 break
             for r in wanted.get(idx, []):
                 img = draw_overlay(_fit(frame, FRAME_MAX_SIDE), r['points'], r.get('elbow_angle_deg'),
-                                   r.get('label'), r.get('caption'), r.get('time_s'))
+                                   r.get('label'), r.get('caption'), r.get('time_s'), None, r.get('view', 'side'), r.get('body'))
                 if cv2.imwrite(str(out_dir / r['name']), img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]):
                     written.add(r['name'])
             idx += 1
@@ -162,7 +181,7 @@ def _phase_at(t, start, end, peak):
     return 'Follow-through'
 
 
-def render_overlay_video(video_path, rows, windows, out_path):
+def render_overlay_video(video_path, rows, windows, out_path, view='side', body=None):
     """Annotated MP4 of the clip (first OVERLAY_MAX_SECONDS). rows need 'frame_idx', 'time_s', 'points',
     'elbow_angle_deg'; windows: [(throw_no, start_s, end_s[, peak_s])]. Returns out_path or None if no H.264 encoder."""
     cap = cv2.VideoCapture(str(video_path))
@@ -202,8 +221,12 @@ def render_overlay_video(video_path, rows, windows, out_path):
             phase = _phase_at(t, start, end, peak) if n is not None else None
             label = f'Throw {n} - {phase}' if n is not None and phase else (f'Throw {n}' if n is not None else 'Oche Lab')
             ang = r.get('elbow_angle_deg')
-            badge = f'Release {ang:.0f} deg' if phase == 'Release' and ang is not None else None
-            img = draw_overlay(_fit(frame, OVERLAY_MAX_SIDE), r['points'], ang, label, None, t, badge)
+            if view == 'front':
+                off = front_offset(r['points'], body)
+                badge = f"Release line {abs(off) * 100:.0f}% {'out' if off > 0 else 'in'}" if phase == 'Release' and off is not None else None
+            else:
+                badge = f'Release {ang:.0f} deg' if phase == 'Release' and ang is not None else None
+            img = draw_overlay(_fit(frame, OVERLAY_MAX_SIDE), r['points'], ang, label, None, t, badge, view, body)
             if img.shape[1] != size[0] or img.shape[0] != size[1]:
                 img = cv2.resize(img, size)
             writer.write(img)

@@ -382,7 +382,7 @@ def phase_caption(rows, phase, i, wrist_speed=None):
     return f'Follow-through: arm extends to {_fmt_deg(a)}.'
 
 
-def build_review(rows, segments, throws, wrist_speed=None, url_prefix=None):
+def build_review(rows, segments, throws, wrist_speed=None, url_prefix=None, view='side'):
     """Key frames per throw plus a time-sorted timeline of phases and tips.
 
     segments: [{'indices', 'peak_index'}] aligned with throws (which already carry 'tips').
@@ -395,7 +395,8 @@ def build_review(rows, segments, throws, wrist_speed=None, url_prefix=None):
     for seg, t in zip(segments, throws):
         n = t['throw']
         phases = pick_phases(rows, seg['indices'], seg.get('peak_index'), wrist_speed)
-        obs = phase_observations(rows, phases)
+        front = view == 'front'
+        obs = front_observations(t) if front else phase_observations(rows, phases)
         frames = []
         for phase in PHASES:
             if phase not in phases:
@@ -403,10 +404,10 @@ def build_review(rows, segments, throws, wrist_speed=None, url_prefix=None):
             i = phases[phase]
             name = f't{n}_{phase}.jpg'
             url = f'{url_prefix}{name}' if url_prefix else None
-            base = phase_caption(rows, phase, i, wrist_speed)
+            base = front_caption(t, phase) if front else phase_caption(rows, phase, i, wrist_speed)
             tip = next((m for p, m in obs if p == phase), None)
             frames.append({'phase': phase, 'label': PHASE_LABELS[phase], 'row_index': i, 'time_s': rows[i]['time_s'],
-                           'elbow_angle_deg': _angle(rows, i), 'caption': tip or base, 'observation': base,
+                           'elbow_angle_deg': None if front else _angle(rows, i), 'caption': tip or base, 'observation': base,
                            'frame': name, 'frame_url': url})
             timeline.append({'time_s': rows[i]['time_s'], 'throw': n, 'type': phase, 'message': base, 'frame_url': url})
         by_phase = {f['phase']: f for f in frames}
@@ -415,7 +416,7 @@ def build_review(rows, segments, throws, wrist_speed=None, url_prefix=None):
             timeline.append({'time_s': kf['time_s'] if kf else t['start_s'], 'throw': n, 'type': 'tip', 'message': m,
                              'frame_url': kf['frame_url'] if kf else None})
         if obs:
-            merged = [m for m in t.get('tips', []) if m != POSITIVE_TIP] + [m for _, m in obs]
+            merged = [m for m in t.get('tips', []) if m not in (POSITIVE_TIP, FRONT_POSITIVE_TIP)] + [m for _, m in obs]
             t['tips'] = list(dict.fromkeys(merged))[:MAX_TIPS_PER_THROW]
         anchor = by_phase.get('release') or (frames[0] if frames else None)
         for m in t.get('tips', []):
@@ -427,3 +428,160 @@ def build_review(rows, segments, throws, wrist_speed=None, url_prefix=None):
     order = {p: k for k, p in enumerate(PHASES + ('tip',))}
     timeline.sort(key=lambda e: (e['time_s'], e['throw'], order[e['type']]))
     return all_frames, timeline
+
+
+# ---- Front-on view ------------------------------------------------------------
+# Filmed from in front of the thrower (phone beside the board, angled back). Sideways movement is visible;
+# elbow drop and the elbow angle are foreshortened, so side-on-only metrics are left out (None).
+# Lateral values are in shoulder widths, signed so + = OUTWARD (away from the body on the throwing side)
+# and - = ACROSS the body. That is independent of mirrored selfie footage.
+FRONT_FLARE_HIGH = 0.22         # elbow this far outside the shoulder's vertical line at release = flaring ("chicken wing")
+FRONT_LINE_HIGH = 0.20          # wrist this far off the shoulder line at release
+FRONT_CROSS_HIGH = 0.25         # wrist finishing this far across the body after release
+FRONT_OUT_HIGH = 0.30           # ...or this far out wide
+FRONT_SWAY_HIGH = 0.15          # head moved sideways this many shoulder widths during one throw
+FRONT_LEAN_HIGH_DEG = 6.0       # shoulder line tilted this much more at release than at set-up
+FRONT_RELEASE_SPREAD_HIGH = 0.15  # release point moved sideways this much between throws
+FRONT_RELEASE_SPREAD_TIGHT = 0.06
+FRONT_POSITIVE_TIP = ('Nice one. Your arm stayed on its line and your body stayed still on this throw. '
+                      'Keep that alignment!')
+
+
+def body_frame(rows):
+    """(shoulder_width, outward_sign) from the clip: median shoulder separation and which way is 'out'."""
+    d = [r['points']['shoulder'][0] - r['points']['other_shoulder'][0] for r in rows
+         if r['points'].get('shoulder') and r['points'].get('other_shoulder')]
+    if len(d) < 3:
+        return None, 1.0
+    width = float(np.median(np.abs(d)))
+    return (width if width > 0.02 else None), (1.0 if np.median(d) >= 0 else -1.0)
+
+
+def lateral(p, shoulder, frame):
+    """Sideways offset of point p from the vertical line through the shoulder, in shoulder widths (+ = outward)."""
+    width, sign = frame
+    if p is None or shoulder is None or not width:
+        return None
+    return round(float((p[0] - shoulder[0]) * sign / width), 3)
+
+
+def _near(rows, idx, i, key, k=2):
+    """Point `key` at row i, or the nearest row in this throw window (within k samples) that has it."""
+    if i is None:
+        return None, None
+    for d in range(k + 1):
+        for j in (i - d, i + d):
+            if j in idx and rows[j]['points'].get(key) is not None and rows[j]['points'].get('shoulder') is not None:
+                return rows[j]['points'][key], rows[j]['points']['shoulder']
+    return None, None
+
+
+def _tilt(rows, i):
+    if i is None:
+        return None
+    s, o = rows[i]['points'].get('shoulder'), rows[i]['points'].get('other_shoulder')
+    if s is None or o is None or abs(s[0] - o[0]) < 1e-6:
+        return None
+    return float(np.degrees(np.arctan2(s[1] - o[1], abs(s[0] - o[0]))))  # + = throwing shoulder lower
+
+
+def front_metrics(rows, indices, phases, frame):
+    """Front-on metrics for one throw window (see constants above). Missing values are None."""
+    idx = set(int(i) for i in indices)
+    r, s, f = phases.get('release'), phases.get('setup'), phases.get('follow_through')
+    e_r, sh_r = _near(rows, idx, r, 'elbow')
+    w_r, sh_w = _near(rows, idx, r, 'wrist')
+    w_f, sh_f = _near(rows, idx, f, 'wrist')
+    forearm = None
+    if e_r is not None and w_r is not None and frame[0]:
+        dx, dy = (w_r[0] - e_r[0]) * frame[1], e_r[1] - w_r[1]
+        forearm = round(float(np.degrees(np.arctan2(dx, max(abs(dy), 1e-6)))), 1)  # + = hand outside the elbow
+    heads = [rows[i]['points']['head'][0] for i in sorted(idx) if rows[i]['points'].get('head') is not None]
+    sway = round(float(np.ptp(heads)) / frame[0], 3) if len(heads) >= 3 and frame[0] else None
+    ts, tr = _tilt(rows, s), _tilt(rows, r)
+    lean = round(tr - ts, 1) if ts is not None and tr is not None else None
+    return {'elbow_flare': lateral(e_r, sh_r, frame), 'wrist_line_release': lateral(w_r, sh_w, frame),
+            'forearm_deviation_deg': forearm, 'head_sway': sway, 'shoulder_tilt_change_deg': lean,
+            'follow_through_lateral': lateral(w_f, sh_f, frame)}
+
+
+def front_observations(m):
+    """Coaching observations (phase, message) for one throw's front-on metrics. Experimental heuristics."""
+    obs = []
+    fl, wl, ft, sw, ln = (m.get(k) for k in ('elbow_flare', 'wrist_line_release', 'follow_through_lateral',
+                                              'head_sway', 'shoulder_tilt_change_deg'))
+    if fl is not None and fl > FRONT_FLARE_HIGH:
+        obs.append(('release', f'Your elbow flared out at release ({fl * 100:.0f}% of a shoulder width outside your '
+                               'shoulder line). Keep the elbow tucked under the dart so the arm swings straight.'))
+    elif wl is not None and abs(wl) > FRONT_LINE_HIGH:
+        side = 'outside' if wl > 0 else 'inside'
+        obs.append(('release', f'Your hand released {abs(wl) * 100:.0f}% of a shoulder width {side} your shoulder line. '
+                               'Line the dart, hand and elbow up under your aiming eye.'))
+    if ft is not None and ft < -FRONT_CROSS_HIGH:
+        obs.append(('follow_through', 'Your hand finished across your body. Follow through straight at the target '
+                                      'rather than pulling it in.'))
+    elif ft is not None and ft > FRONT_OUT_HIGH:
+        obs.append(('follow_through', 'Your hand finished out wide. Point your follow-through straight at the '
+                                      'target, not out to the side.'))
+    if sw is not None and sw > FRONT_SWAY_HIGH:
+        obs.append(('release', 'Your head and body swayed sideways during the throw. Keep your weight still on '
+                               'your front foot until the dart lands.'))
+    elif ln is not None and abs(ln) > FRONT_LEAN_HIGH_DEG:
+        obs.append(('release', f'Your shoulders tilted {abs(ln):.0f}° between set-up and release. Stay level and '
+                               'let only the arm move.'))
+    return obs
+
+
+def front_throw_tips(throws):
+    """Front-on version of throw_tips: alignment and sway first, then consistency with the other throws."""
+    out = []
+    for i, t in enumerate(throws):
+        tips = []
+        if t['valid_frames'] < LOW_VALID_FRAMES:
+            tips.append(f"Only {t['valid_frames']} clear frames on this throw. Keep your head, both shoulders and "
+                        'throwing arm in frame, with even light.')
+        tips += [m for _, m in front_observations(t)]
+        wl, wl_o = t.get('wrist_line_release'), _others_median(throws, i, 'wrist_line_release')
+        if not tips and wl is not None and wl_o is not None and abs(wl - wl_o) > FRONT_RELEASE_SPREAD_HIGH:
+            tips.append(f"Your release point was {abs(wl - wl_o) * 100:.0f}% of a shoulder width "
+                        f"{'further out' if wl > wl_o else 'further in'} than on your other throws. "
+                        'Aim to release from the same spot every time.')
+        out.append((tips or [FRONT_POSITIVE_TIP])[:MAX_TIPS_PER_THROW])
+    return out
+
+
+def front_session_tips(throws, method, arm_detected_pct=None):
+    tips = []
+    if method != 'auto':
+        tips.append('Throws were not detected automatically, so these windows may not line up with each throw. '
+                    'Trim idle time and keep the camera still, then try again.')
+    rel = [t['wrist_line_release'] for t in throws if t.get('wrist_line_release') is not None]
+    if len(rel) >= 2:
+        spread = max(rel) - min(rel)
+        if spread > FRONT_RELEASE_SPREAD_HIGH:
+            tips.append(f'Your release point moved sideways by {spread * 100:.0f}% of a shoulder width across throws. '
+                        'A repeatable line is what tightens left-right grouping.')
+        elif spread <= FRONT_RELEASE_SPREAD_TIGHT and method == 'auto':
+            tips.append('Great line: your release point stayed in the same place sideways on every throw.')
+    flares = [t['elbow_flare'] for t in throws if t.get('elbow_flare') is not None]
+    if flares and float(np.median(flares)) > FRONT_FLARE_HIGH:
+        tips.append('Your elbow flared out on most throws (a "chicken wing"). Keeping it under the dart is the '
+                    'quickest fix for left-right misses.')
+    sways = [t['head_sway'] for t in throws if t.get('head_sway') is not None]
+    if sways and float(np.median(sways)) > FRONT_SWAY_HIGH:
+        tips.append('Your body swayed sideways on most throws. Work on a balanced stance with your weight forward.')
+    if arm_detected_pct is not None and arm_detected_pct < SESSION_LOW_DETECTION_PCT:
+        tips.append(f'Your arm was only tracked in {arm_detected_pct:.0f}% of frames. Film from beside the board at '
+                    'eye height with your whole upper body in frame.')
+    return tips[:MAX_SESSION_TIPS]
+
+
+def front_caption(m, phase):
+    fmt = lambda v: 'not tracked' if v is None else f"{abs(v) * 100:.0f}% {'out' if v > 0 else 'in'}"
+    if phase == 'setup':
+        return 'Set-up: stand still and line the dart up with your eye.'
+    if phase == 'backswing':
+        return 'Take-back: keep the hand on the same line as the elbow.'
+    if phase == 'release':
+        return f"Release: elbow {fmt(m.get('elbow_flare'))}, hand {fmt(m.get('wrist_line_release'))} of the shoulder line."
+    return f"Follow-through: hand finishes {fmt(m.get('follow_through_lateral'))} of the shoulder line."
