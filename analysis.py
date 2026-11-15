@@ -23,6 +23,19 @@ MAX_THROWS = 15             # hard cap; the app also sends max_throws (darts on 
 EXT_WINDOW_S = 0.35          # side-on: look this far either side of a peak for the arm extending forward...
 EXT_MIN_ELBOW_DEG = 15       # ...elbow opening by at least this much...
 EXT_MIN_REACH = 0.25         # ...or wrist moving away from the shoulder by this fraction of upper-arm length
+# Whole-body movement gate (walking to collect darts, stepping in/out of frame). Distances are in torso
+# lengths (mid-shoulder to mid-hip), measured around each candidate throw.
+BODY_WIN_BEFORE_S = 0.8      # look this far before the release...
+BODY_WIN_AFTER_S = 0.3       # ...and this far after it
+BODY_SHIFT_MAX = 0.35        # hips (or shoulders) travel sideways more than this = walking, not throwing
+BODY_SCALE_MAX = 1.18        # body size changes by more than 18% = walking towards / away from the camera
+FEET_SHIFT_MAX = 0.25        # an ankle moves more than this = stepping
+STANCE_BEFORE_S = (0.8, 0.3) # stable-stance window before release (0.5 s)...
+STANCE_SHIFT_MAX = 0.18      # ...in which the body may drift at most this much
+MIN_PRESENT_FRAC = 0.75      # body tracked in at least this share of the window (not leaving / entering frame)
+MIN_POSE_CONF = 0.6          # mean arm-landmark confidence in the window
+AWAY_SHIFT_MAX = 1.0         # body more than this many torso lengths from its usual (oche) spot = at the board / walking
+AWAY_SCALE_MAX = 1.3         # body size this far off its usual size = nearer / further than the oche
 MIN_VALID_SIGNAL_PCT = 0.5   # need wrist coverage on at least half the frames to try auto
 FALLBACK_WINDOWS = 3
 
@@ -90,10 +103,17 @@ def smooth(values, frames=SMOOTH_FRAMES):
     return out.reshape(arr.shape)
 
 
-def speed_signals(wrist_points, elbow_angles, times):
-    """Return (wrist_speed, elbow_angular_speed) per sampled frame; NaN where unknown."""
+def speed_signals(wrist_points, elbow_angles, times, shoulder_points=None):
+    """Return (wrist_speed, elbow_angular_speed) per sampled frame; NaN where unknown.
+
+    With shoulder_points the wrist is measured relative to the shoulder, so walking (the whole body
+    translating) doesn't look like a fast arm."""
     t = np.asarray(times, dtype=float)
-    wrist = smooth(interpolate_gaps(_series(wrist_points), t))
+    w = _series(wrist_points)
+    if shoulder_points is not None:
+        sh = interpolate_gaps(_series(shoulder_points), t)
+        w = w - sh
+    wrist = smooth(interpolate_gaps(w, t))
     ang = np.array([np.nan if a is None else a for a in elbow_angles], dtype=float)
     ang = smooth(interpolate_gaps(ang, t))
     if len(t) < 3:
@@ -209,6 +229,87 @@ def is_forward_throw(rows, times, peak):
     return (open_deg is not None and open_deg >= EXT_MIN_ELBOW_DEG) or (reach is not None and reach >= EXT_MIN_REACH)
 
 
+def _mid(a, b):
+    if a is None and b is None:
+        return None
+    if a is None or b is None:
+        return a if a is not None else b
+    return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
+
+
+def body_track(rows):
+    """Per row: body centre (mid-hip, else mid-shoulder), torso length, ankles; and the clip's torso scale."""
+    centre, torso, hips_seen = [], [], 0
+    for r in rows:
+        p = r['points']
+        sh, hp = _mid(p.get('shoulder'), p.get('other_shoulder')), _mid(p.get('hip'), p.get('other_hip'))
+        hips_seen += hp is not None
+        centre.append(hp if hp is not None else sh)
+        torso.append(float(np.hypot(sh[0] - hp[0], sh[1] - hp[1])) if sh is not None and hp is not None else np.nan)
+    torso = np.array(torso, dtype=float)
+    scale = float(np.nanmedian(torso)) if np.isfinite(torso).any() else None
+    if not scale or scale < 0.03:
+        ua = [float(np.hypot(*np.subtract(r['points']['elbow'], r['points']['shoulder']))) for r in rows
+              if r['points'].get('elbow') is not None and r['points'].get('shoulder') is not None]
+        scale = 1.6 * float(np.median(ua)) if ua else 0.25  # torso ~ 1.6 upper arms
+    c = _series(centre)
+    seen = np.isfinite(c).all(axis=1)
+    home = np.median(c[seen], axis=0) if seen.any() else None   # where the thrower usually stands (the oche)
+    return {'centre': c, 'torso': torso, 'scale': scale, 'home': home,
+            'ankles': [_series([r['points'].get(k) for r in rows]) for k in ('ankle', 'other_ankle')],
+            'present': np.array([r['points'].get('shoulder') is not None for r in rows]),
+            'conf': np.array([np.nan if r.get('conf') is None else r['conf'] for r in rows], dtype=float),
+            'has_conf': any('conf' in r for r in rows)}
+
+
+def _travel(xy, m):
+    """Largest distance of tracked points in mask m from their median (robust to single-frame jitter)."""
+    a = xy[m]
+    a = a[np.isfinite(a).all(axis=1)]
+    if len(a) < 3:
+        return None
+    lo, hi = np.percentile(a, 10, axis=0), np.percentile(a, 90, axis=0)
+    return float(np.hypot(*(hi - lo)))
+
+
+def body_movement(body, times, peak):
+    """Why the candidate throw at `peak` looks like whole-body movement, or None if the body was still."""
+    t = np.asarray(times, dtype=float)
+    win = (t >= t[peak] - BODY_WIN_BEFORE_S) & (t <= t[peak] + BODY_WIN_AFTER_S)
+    if win.sum() < 3:
+        return None
+    sc = body['scale']
+    if body['present'][win].mean() < MIN_PRESENT_FRAC:
+        return 'out of frame'
+    if body['has_conf']:
+        c = body['conf'][win]
+        c = c[np.isfinite(c)]
+        if len(c) and float(np.mean(c)) < MIN_POSE_CONF:
+            return 'low pose confidence'
+    cx = body['centre'][:, 0:1]
+    shift = _travel(np.hstack([cx, np.zeros_like(cx)]), win)
+    if shift is not None and shift / sc > BODY_SHIFT_MAX:
+        return 'body moved sideways'
+    tor = body['torso'][win]
+    tor = tor[np.isfinite(tor)]
+    if len(tor) >= 3 and np.percentile(tor, 10) > 0 and np.percentile(tor, 90) / np.percentile(tor, 10) > BODY_SCALE_MAX:
+        return 'walked towards / away from the camera'
+    for ank in body['ankles']:
+        mv = _travel(ank, win)
+        if mv is not None and mv / sc > FEET_SHIFT_MAX:
+            return 'feet moving'
+    home, here, tp = body.get('home'), body['centre'][peak], body['torso'][peak]
+    if home is not None and np.isfinite(here).all() and abs(here[0] - home[0]) / sc > AWAY_SHIFT_MAX:
+        return 'away from the throwing position'
+    if np.isfinite(tp) and tp > 0 and max(tp / sc, sc / tp) > AWAY_SCALE_MAX:
+        return 'away from the throwing position'
+    pre = (t >= t[peak] - STANCE_BEFORE_S[0]) & (t <= t[peak] - STANCE_BEFORE_S[1])
+    drift = _travel(body['centre'], pre)
+    if drift is not None and drift / sc > STANCE_SHIFT_MAX:
+        return 'no stable stance before release'
+    return None
+
+
 def segment_throws(rows, view='side', max_throws=None):
     """Detect throws from wrist/elbow motion. Falls back to equal windows if detection fails.
 
@@ -219,7 +320,8 @@ def segment_throws(rows, view='side', max_throws=None):
     """
     times = [r['time_s'] for r in rows]
     wrist_pts = [r['points'].get('wrist') for r in rows]
-    wrist_speed, elbow_speed = speed_signals(wrist_pts, [r['elbow_angle_deg'] for r in rows], times)
+    wrist_speed, elbow_speed = speed_signals(wrist_pts, [r['elbow_angle_deg'] for r in rows], times,
+                                             [r['points'].get('shoulder') for r in rows])
     reason = None
     coverage = float(np.mean(~np.isnan(wrist_speed))) if len(rows) else 0.0
     if len(rows) < 3 * MIN_WINDOW_FRAMES:
@@ -228,8 +330,17 @@ def segment_throws(rows, view='side', max_throws=None):
         reason = 'wrist not tracked consistently'
     else:
         sig = detection_signal(wrist_speed, elbow_speed)
-        thr = adaptive_threshold(sig)
-        peaks = find_peaks(sig, times, thr)
+        # Candidate bursts (no separation merge yet, so a walk can't swallow a nearby real throw),
+        # minus anything where the whole body moved: walking to the board, stepping, leaving the frame.
+        # Every sample is checked as if it were a release; samples where the whole body was moving are
+        # removed from the signal before thresholding, so a big walking burst can't raise the bar either.
+        body = body_track(rows)
+        moving = np.array([body_movement(body, times, i) is not None for i in range(len(rows))])
+        raw_peaks = find_peaks(sig, times, adaptive_threshold(sig), min_sep_s=0.0)
+        rejected = sum(bool(moving[p]) for p in raw_peaks)
+        sig = np.where(moving, 0.0, sig)
+        peaks = find_peaks(sig, times, adaptive_threshold(sig)) if sig.max() > 0 else []
+        still = bool(peaks)
         if view != 'front' and peaks:
             forward = [p for p in peaks if is_forward_throw(rows, times, p)]
             peaks = forward or peaks  # if nothing passes, tracking is too rough to judge: keep the motion peaks
@@ -239,11 +350,12 @@ def segment_throws(rows, view='side', max_throws=None):
         wins = windows_around_peaks(peaks, times)
         if wins:
             n = len(wins)
+            ignored = f' Ignored {rejected} burst{"s" if rejected != 1 else ""} of whole-body movement (walking or stepping).' if rejected else ''
             return {'method': 'auto',
-                    'sentence': f"Detected {n} throw{'s' if n != 1 else ''} automatically from wrist and elbow speed peaks.",
+                    'sentence': f"Detected {n} throw{'s' if n != 1 else ''} automatically from wrist and elbow speed peaks.{ignored}",
                     'segments': [{'indices': idx, 'peak_index': int(p)} for p, idx in wins],
                     'wrist_speed': wrist_speed}
-        reason = 'no clear motion peaks'
+        reason = 'only whole-body movement found' if rejected and not still else 'no clear motion peaks'
     segs = np.array_split(np.arange(len(rows)), FALLBACK_WINDOWS)
     return {'method': 'equal_windows_fallback',
             'sentence': f'Automatic throw detection failed ({reason}); split the clip into three equal time windows instead.',

@@ -20,7 +20,7 @@ from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_
                       pick_phases, segment_throws, session_tips, summarise_throw, throw_mechanics, throw_tips)
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 
-VERSION = '0.8.0'
+VERSION = '0.8.1'
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
 
 app = FastAPI(title='Oche Lab Motion API', version=VERSION)
@@ -28,8 +28,10 @@ app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], all
 
 # MediaPipe Pose landmark indices. Left/right are the thrower's own sides.
 ARM_KEYS = {
-    'right': {'head': 0, 'shoulder': 12, 'elbow': 14, 'wrist': 16, 'other_shoulder': 11},
-    'left': {'head': 0, 'shoulder': 11, 'elbow': 13, 'wrist': 15, 'other_shoulder': 12},
+    'right': {'head': 0, 'shoulder': 12, 'elbow': 14, 'wrist': 16, 'other_shoulder': 11,
+              'hip': 24, 'other_hip': 23, 'ankle': 28, 'other_ankle': 27},
+    'left': {'head': 0, 'shoulder': 11, 'elbow': 13, 'wrist': 15, 'other_shoulder': 12,
+             'hip': 23, 'other_hip': 24, 'ankle': 27, 'other_ankle': 28},
 }
 MAX_BYTES = 150 * 1024 * 1024
 MAX_SECONDS = 75               # clips up to ~1 minute (with a little slack)
@@ -110,14 +112,19 @@ def extract_rows(path, arm='right', on_progress=None):
                 scale = MAX_POSE_DIM / max(h, w)
                 frame = cv2.resize(frame, None, fx=scale, fy=scale)
             result = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            coords = {}
+            coords, conf = {}, None
             for key, landmark_idx in keys.items():
                 if result.pose_landmarks:
                     p = result.pose_landmarks.landmark[landmark_idx]
                     coords[key] = [round(p.x, 5), round(p.y, 5)] if p.visibility >= 0.55 else None
                 else:
                     coords[key] = None
-            rows.append(make_row(idx, fps, coords))
+            if result.pose_landmarks:  # arm landmark confidence: throws seen through a blurry/partial pose are rejected
+                lm = result.pose_landmarks.landmark
+                conf = round(float(np.mean([lm[keys[k]].visibility for k in ('shoulder', 'elbow', 'wrist')])), 3)
+            row = make_row(idx, fps, coords)
+            row['conf'] = conf
+            rows.append(row)
             idx += 1
             if on_progress and len(rows) % 10 == 0:
                 on_progress(min(1.0, idx / max(count, 1)))
