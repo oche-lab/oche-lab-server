@@ -235,7 +235,7 @@ def _phase_at(t, start, end, peak):
     return 'Follow-through'
 
 
-def render_overlay_video(video_path, rows, windows, out_path, view='side', body=None):
+def render_overlay_video(video_path, rows, windows, out_path, view='side', body=None, on_progress=None):
     """Annotated MP4 of the clip (first OVERLAY_MAX_SECONDS). rows need 'frame_idx', 'time_s', 'points',
     'elbow_angle_deg'; windows: [(throw_no, start_s, end_s[, peak_s])]. Returns out_path or None if no H.264 encoder."""
     cap, rot = open_video(video_path)
@@ -266,6 +266,7 @@ def render_overlay_video(video_path, rows, windows, out_path, view='side', body=
         return None
     sampled = [r['frame_idx'] for r in rows]
     j, idx, limit = 0, 0, int(fps * OVERLAY_MAX_SECONDS)
+    total = min(limit, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or limit)) or 1
     try:
         while ok and idx < limit:
             while j + 1 < len(rows) and sampled[j + 1] <= idx:
@@ -289,6 +290,8 @@ def render_overlay_video(video_path, rows, windows, out_path, view='side', body=
             if ok:
                 frame = upright(frame, rot)
             idx += 1
+            if on_progress and idx % 15 == 0:
+                on_progress(min(1.0, idx / total))
     finally:
         writer.release()
         cap.release()

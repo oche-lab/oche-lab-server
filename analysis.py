@@ -16,7 +16,7 @@ PEAK_MAD_K = 4.0             # adaptive threshold = median + k * (1.4826 * MAD)
 PEAK_MIN_WRIST_SPEED = 0.25  # absolute floor, normalised image units / second
 PEAK_MAX_FRAC = 0.5          # threshold never above this fraction of the tallest peak (busy clips)
 PEAK_MIN_REL_HEIGHT = 0.4    # ignore peaks smaller than this fraction of the tallest (arm return etc.)
-WINDOW_BEFORE_S = 0.7        # window starts this long before the peak...
+WINDOW_BEFORE_S = 1.1        # window starts this long before the peak (room for a paused take-back + set-up)...
 WINDOW_AFTER_S = 0.4         # ...and ends this long after it
 MIN_WINDOW_FRAMES = 4        # drop windows with fewer sampled frames than this
 MAX_THROWS = 15             # hard cap; the app also sends max_throws (darts on board photos / 3 per visit)
@@ -407,6 +407,78 @@ def pick_phases(rows, indices, peak_index=None, wrist_speed=None):
         if i is not None:
             out[name] = i
     return out
+
+
+def _r(v, nd=1):
+    return None if v is None or not np.isfinite(v) else round(float(v), nd)
+
+
+def _arm_at(rows, idx, i, k=2):
+    """(shoulder, elbow, wrist) at row i, borrowing from the nearest row within k samples when missing."""
+    out = []
+    for key in ('shoulder', 'elbow', 'wrist'):
+        p = None
+        for d in range(k + 1):
+            for j in (i - d, i + d):
+                if j in idx and rows[j]['points'].get(key) is not None:
+                    p = rows[j]['points'][key]
+                    break
+            if p is not None:
+                break
+        out.append(p)
+    return out
+
+
+def throw_mechanics(rows, indices, phases, view='side'):
+    """Phase-by-phase arm angles and timing for one throw (2D, experimental). Additive output for the app's review.
+
+    phases[name] = {t, elbow_deg, upper_arm_deg, forearm_deg, wrist_height} for setup/backswing/release/follow_through.
+      upper_arm_deg: upper arm below horizontal (+ = elbow lower than shoulder); forearm_deg: forearm above
+      horizontal (+ = hand higher than elbow); wrist_height: hand above the shoulder in upper-arm lengths.
+    timing: aim_s (set-up -> take-back), pullback_s (take-back -> release), finish_s (release -> follow-through).
+    elbow_drop_deg: upper arm angle change from take-back (or set-up) to release, + = elbow dropped.
+    body_shift: shoulder travel during the throw in upper-arm lengths (stance stability).
+    Front-on: elbow and arm angles are foreshortened, so they are None; timing, wrist height and shift remain.
+    """
+    idx = set(int(i) for i in indices)
+    front = view == 'front'
+    ul = [float(np.linalg.norm(np.subtract(rows[i]['points']['elbow'], rows[i]['points']['shoulder']))) for i in idx
+          if rows[i]['points'].get('elbow') is not None and rows[i]['points'].get('shoulder') is not None]
+    ulen = float(np.median(ul)) if ul else None
+    out_ph = {}
+    for name in PHASES:
+        i = phases.get(name)
+        if i is None or (name == 'setup' and i == phases.get('backswing')):
+            continue
+        sh, el, wr = _arm_at(rows, idx, i)
+        upper = fore = height = None
+        if sh is not None and el is not None:
+            upper = np.degrees(np.arctan2(el[1] - sh[1], abs(el[0] - sh[0]) + 1e-9))
+        if el is not None and wr is not None:
+            fore = np.degrees(np.arctan2(el[1] - wr[1], abs(wr[0] - el[0]) + 1e-9))
+        if sh is not None and wr is not None and ulen:
+            height = (sh[1] - wr[1]) / ulen
+        out_ph[name] = {'t': rows[i]['time_s'], 'elbow_deg': None if front else _angle(rows, i),
+                        'upper_arm_deg': None if front else _r(upper), 'forearm_deg': None if front else _r(fore),
+                        'wrist_height': _r(height, 3)}
+    t = {k: v['t'] for k, v in out_ph.items()}
+    gap = lambda a, b: _r(t[b] - t[a], 3) if a in t and b in t else None
+    ref = out_ph.get('backswing') or out_ph.get('setup')
+    rel = out_ph.get('release')
+    drop = None
+    if not front and ref and rel and ref['upper_arm_deg'] is not None and rel['upper_arm_deg'] is not None:
+        drop = _r(rel['upper_arm_deg'] - ref['upper_arm_deg'])
+    shoulders = [rows[i]['points']['shoulder'] for i in sorted(idx) if rows[i]['points'].get('shoulder') is not None]
+    shift = None
+    if len(shoulders) >= 3 and ulen:
+        a = np.array(shoulders, dtype=float)
+        shift = _r(float(np.max(np.linalg.norm(a - np.median(a, axis=0), axis=1))) / ulen, 3)
+    return {'phases': out_ph,
+            'timing': {'aim_s': gap('setup', 'backswing'), 'pullback_s': gap('backswing', 'release'),
+                       'finish_s': gap('release', 'follow_through')},
+            'elbow_drop_deg': drop,
+            'follow_through_deg': None if front else (out_ph.get('follow_through') or {}).get('elbow_deg'),
+            'body_shift': shift}
 
 
 def _fmt_deg(a):

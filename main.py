@@ -17,10 +17,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_session_tips, front_throw_tips,
-                      pick_phases, segment_throws, session_tips, summarise_throw, throw_tips)
+                      pick_phases, segment_throws, session_tips, summarise_throw, throw_mechanics, throw_tips)
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 
-VERSION = '0.7.1'
+VERSION = '0.8.0'
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
 
 app = FastAPI(title='Oche Lab Motion API', version=VERSION)
@@ -75,7 +75,7 @@ MODEL_COMPLEXITY = 0 if LOW_MEM else 1
 MAX_POSE_DIM = 640 if LOW_MEM else 960
 
 
-def extract_rows(path, arm='right'):
+def extract_rows(path, arm='right', on_progress=None):
     """Run MediaPipe Pose on sampled frames. Returns (rows, fps). Heavy imports stay local."""
     import mediapipe as mp
     keys = ARM_KEYS[arm]
@@ -119,6 +119,8 @@ def extract_rows(path, arm='right'):
                     coords[key] = None
             rows.append(make_row(idx, fps, coords))
             idx += 1
+            if on_progress and len(rows) % 10 == 0:
+                on_progress(min(1.0, idx / max(count, 1)))
             if len(rows) > 1200:
                 break
     cap.release()
@@ -134,7 +136,7 @@ def make_row(frame_idx, fps, coords):
             'elbow_angle_deg': angle(shoulder, elbow, wrist), 'head_relative': head_relative}
 
 
-def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, view='side', max_throws=None):
+def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, view='side', max_throws=None, progress=None):
     """Segment throws, compute metrics/tips, render annotated key frames (+ optional overlay MP4)."""
     if len(rows) < 15:
         raise ValueError('Not enough video frames could be analysed.')
@@ -142,6 +144,8 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
     if detected / len(rows) < 0.55:
         raise ValueError('Throwing arm not visible enough. ' + ('Film from beside the board at eye height with your whole upper body in frame.'
                          if view == 'front' else 'Use a fixed side-on camera and good lighting.'))
+    progress = progress or (lambda stage, frac=0.0: None)
+    progress('throws')
     # Automatic throw detection from wrist/elbow speed peaks; equal thirds only as a fallback.
     seg = segment_throws(rows, view=view, max_throws=max_throws)
     summaries = [summarise_throw(rows, sg['indices'], i+1, sg['peak_index'], seg['wrist_speed'])
@@ -150,6 +154,8 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
     if view == 'front':  # sideways alignment/sway metrics; side-on-only elbow metrics stay in but are flagged n/a
         for t, sg in zip(summaries, seg['segments']):
             t.update(front_metrics(rows, sg['indices'], pick_phases(rows, sg['indices'], sg['peak_index'], seg['wrist_speed']), frame))
+    for t, sg in zip(summaries, seg['segments']):  # phase-by-phase angles and timing for the detailed review
+        t['mechanics'] = throw_mechanics(rows, sg['indices'], pick_phases(rows, sg['indices'], sg['peak_index'], seg['wrist_speed']), view)
     for t, tips in zip(summaries, (front_throw_tips if view == 'front' else throw_tips)(summaries)):
         t['tips'] = tips
     if view == 'front':  # elbow angles are foreshortened from the front: not reported
@@ -167,6 +173,7 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
                  'label': f"Throw {t['throw']} - {kf['label']}", 'caption': kf['caption'], 'time_s': kf['time_s'],
                  'view': view, 'body': frame}
                 for t, frames in zip(summaries, key_frames) for kf in frames]
+    progress('frames')
     try:
         written = render_key_frames(path, requests, out_dir)
     except Exception:  # rendering must never break the metrics response
@@ -183,9 +190,11 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
             e['frame_url'] = None
     overlay_url, overlay_note = None, None
     if overlay:
+        progress('overlay', 0.0)
         try:
             done = render_overlay_video(path, rows, [(t['throw'], t['start_s'], t['end_s'], t.get('peak_time_s')) for t in summaries],
-                                        out_dir / 'overlay.mp4', view=view, body=frame)
+                                        out_dir / 'overlay.mp4', view=view, body=frame,
+                                        on_progress=lambda f: progress('overlay', f))
         except Exception:
             done = None
         overlay_url = f'/analysis/{analysis_id}/overlay.mp4' if done else None
@@ -208,14 +217,26 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
                           for r in rows[::max(1,len(rows)//120)]]}
 
 
-def analyse(path, arm='right', overlay=False, view='side', max_throws=None):
-    rows, fps = extract_rows(path, arm)
-    return build_result(path, rows, fps, arm, overlay, view=view, max_throws=max_throws)
+# Job progress: each stage owns a slice of 0..1 so the app can show one honest progress bar.
+STAGES = {'pose': (0.0, 0.62), 'throws': (0.62, 0.66), 'frames': (0.66, 0.72), 'overlay': (0.72, 0.99)}
+STAGE_LABELS = {'queued': 'Waiting for the server', 'pose': 'Detecting your pose', 'throws': 'Finding throws & scoring',
+                'frames': 'Drawing key frames', 'overlay': 'Rendering skeleton replay', 'done': 'Done'}
+
+
+def analyse(path, arm='right', overlay=False, view='side', max_throws=None, report=None):
+    """report(stage, overall_fraction) is called as the analysis moves through STAGES (optional)."""
+    def progress(stage, frac=0.0):
+        if report:
+            lo, hi = STAGES[stage]
+            report(stage, round(lo + (hi - lo) * max(0.0, min(1.0, frac)), 3))
+    progress('pose')
+    rows, fps = extract_rows(path, arm, on_progress=lambda f: progress('pose', f))
+    return build_result(path, rows, fps, arm, overlay, view=view, max_throws=max_throws, progress=progress)
 
 
 @app.get('/health')
 def health():
-    return {'ok':True, 'version':VERSION, 'views':list(VIEWS)}
+    return {'ok':True, 'version':VERSION, 'views':list(VIEWS), 'features':['job_progress', 'mechanics']}
 
 
 @app.get('/analysis/{analysis_id}/frames/{name}')
@@ -250,9 +271,11 @@ def _set_job(job_id, **fields):
 
 
 def _run_job(job_id, path, arm, overlay, view='side', max_throws=None):
-    _set_job(job_id, status='running')
+    _set_job(job_id, status='running', stage='pose', stage_label=STAGE_LABELS['pose'], progress=0.0)
+    report = lambda stage, frac: _set_job(job_id, stage=stage, stage_label=STAGE_LABELS[stage], progress=frac)
     try:
-        _set_job(job_id, status='done', result=analyse(path, arm, overlay, view, max_throws))
+        result = analyse(path, arm, overlay, view, max_throws, report)
+        _set_job(job_id, status='done', stage='done', stage_label=STAGE_LABELS['done'], progress=1.0, result=result)
     except ValueError as e:
         _set_job(job_id, status='error', error=str(e))
     except Exception as e:  # pragma: no cover - surfaced to the app as a readable message
@@ -305,7 +328,7 @@ async def analyse_video(video: UploadFile = File(...), arm: str = Form('right'),
     if mode == 'job':
         _prune_jobs()
         job_id = uuid.uuid4().hex
-        _set_job(job_id, status='queued')
+        _set_job(job_id, status='queued', stage='queued', stage_label=STAGE_LABELS['queued'], progress=0.0)
         EXECUTOR.submit(_run_job, job_id, path, arm, overlay, view, max_throws)
         return {'job_id': job_id, 'status': 'queued'}
     try:
