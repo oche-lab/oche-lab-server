@@ -1,4 +1,5 @@
 """Oche Lab experimental motion tracker (side-on or front-on camera). Not a validated biomechanics device."""
+import logging
 import os
 import re
 import shutil
@@ -20,7 +21,9 @@ from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_
                       pick_phases, segment_throws, session_tips, summarise_throw, throw_mechanics, throw_tips)
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 
-VERSION = '0.8.1'
+VERSION = '0.8.2'
+log = logging.getLogger('oche.detect')
+logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
 
 app = FastAPI(title='Oche Lab Motion API', version=VERSION)
@@ -155,6 +158,10 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
     progress('throws')
     # Automatic throw detection from wrist/elbow speed peaks; equal thirds only as a fallback.
     seg = segment_throws(rows, view=view, max_throws=max_throws)
+    # Per-candidate reasons (times and motion only, no video) so missed / extra throws can be diagnosed from the logs.
+    dbg = seg.get('debug') or {}
+    log.info('detection %s view=%s %s | %s', analysis_id or '-', view, dbg.get('summary'),
+             ' '.join(f"{c['time_s']}s:{(c['reason'] or 'kept').split(' (')[0].replace(' ', '_')}" for c in dbg.get('candidates', [])))
     summaries = [summarise_throw(rows, sg['indices'], i+1, sg['peak_index'], seg['wrist_speed'])
                  for i, sg in enumerate(seg['segments'])]
     frame = body_frame(rows) if view == 'front' else None
@@ -210,7 +217,7 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
     return {'status':'experimental', 'version':VERSION, 'analysis_id':analysis_id, 'expires_in_s':RESULT_TTL_S,
             'arm':arm, 'fps_source':round(fps,2), 'sampled_frames':len(rows),
             'arm_detected_pct':arm_pct,
-            'segmentation_method':seg['method'], 'segmentation':seg['sentence'],
+            'segmentation_method':seg['method'], 'segmentation':seg['sentence'], 'detection_debug': seg.get('debug'),
             'view':view,
             'session_tips':(front_session_tips if view == 'front' else session_tips)(summaries, seg['method'], arm_pct),
             'tips_note':TIPS_NOTE,
