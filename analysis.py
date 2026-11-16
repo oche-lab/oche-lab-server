@@ -754,7 +754,10 @@ def throw_mechanics(rows, indices, phases, view='side'):
         a = np.array(shoulders, dtype=float)
         shift = _r(float(np.max(np.linalg.norm(a - np.median(a, axis=0), axis=1))) / ulen, 3)
     return {'phases': out_ph,
-            'timing': {'aim_s': gap('setup', 'backswing'), 'pullback_s': gap('backswing', 'release'),
+            # Front-on, the take-back moves towards the camera and is picked from a foreshortened elbow angle,
+            # so its timing is not reliable: reported as None rather than a misleading number.
+            'timing': {'aim_s': None if front else gap('setup', 'backswing'),
+                       'pullback_s': None if front else gap('backswing', 'release'),
                        'finish_s': gap('release', 'follow_through')},
             'elbow_drop_deg': drop,
             'follow_through_deg': None if front else (out_ph.get('follow_through') or {}).get('elbow_deg'),
@@ -850,9 +853,16 @@ def build_review(rows, segments, throws, wrist_speed=None, url_prefix=None, view
 # elbow drop and the elbow angle are foreshortened, so side-on-only metrics are left out (None).
 # Lateral values are in shoulder widths, signed so + = OUTWARD (away from the body on the throwing side)
 # and - = ACROSS the body. That is independent of mirrored selfie footage.
+# The "shoulder width" is the real one where possible: darts players stand angled to the board, so the
+# shoulders look much narrower from the front than they are. body_frame() floors the apparent width at
+# TORSO_TO_SHOULDER x the shoulder-to-hip length (which doesn't shrink when the body turns).
+# A good release is NOT on the shoulder line: the dart is aimed under the eye, which sits between the
+# throwing shoulder and the middle of the head. FRONT_AIM_IN..FRONT_AIM_OUT is that aiming band.
 FRONT_FLARE_HIGH = 0.22         # elbow this far outside the shoulder's vertical line at release = flaring ("chicken wing")
-FRONT_LINE_HIGH = 0.20          # wrist this far off the shoulder line at release
-FRONT_CROSS_HIGH = 0.25         # wrist finishing this far across the body after release
+FRONT_AIM_IN = -0.60            # hand released up to this far inside the shoulder line = under the aiming eye (fine)
+FRONT_AIM_OUT = 0.15            # ...and up to this far outside it
+TORSO_TO_SHOULDER = 0.75        # shoulder width ~= 0.75 x shoulder-to-hip length (adult average)
+FRONT_CROSS_HIGH = 0.25         # wrist finishing this far across its own release line after release
 FRONT_OUT_HIGH = 0.30           # ...or this far out wide
 FRONT_SWAY_HIGH = 0.15          # head moved sideways this many shoulder widths during one throw
 FRONT_LEAN_HIGH_DEG = 6.0       # shoulder line tilted this much more at release than at set-up
@@ -863,12 +873,25 @@ FRONT_POSITIVE_TIP = ('Nice one. Your arm stayed on its line and your body staye
 
 
 def body_frame(rows):
-    """(shoulder_width, outward_sign) from the clip: median shoulder separation and which way is 'out'."""
+    """(shoulder_width, outward_sign) from the clip: median shoulder separation and which way is 'out'.
+
+    The apparent width shrinks when the thrower stands angled (normal in darts), which would inflate every
+    offset. When hips and the frame aspect are known, the width is floored at TORSO_TO_SHOULDER x torso length.
+    """
     d = [r['points']['shoulder'][0] - r['points']['other_shoulder'][0] for r in rows
          if r['points'].get('shoulder') and r['points'].get('other_shoulder')]
     if len(d) < 3:
         return None, 1.0
     width = float(np.median(np.abs(d)))
+    torso = []
+    for r in rows:
+        p, asp = r['points'], r.get('aspect')
+        if asp and all(p.get(k) for k in ('shoulder', 'other_shoulder', 'hip', 'other_hip')):
+            sy = (p['shoulder'][1] + p['other_shoulder'][1]) / 2
+            hy = (p['hip'][1] + p['other_hip'][1]) / 2
+            torso.append(abs(hy - sy) / asp)  # height-normalised -> width-normalised units
+    if len(torso) >= 3:
+        width = max(width, TORSO_TO_SHOULDER * float(np.median(torso)))
     return (width if width > 0.02 else None), (1.0 if np.median(d) >= 0 else -1.0)
 
 
@@ -900,6 +923,21 @@ def _tilt(rows, i):
     return float(np.degrees(np.arctan2(s[1] - o[1], abs(s[0] - o[0]))))  # + = throwing shoulder lower
 
 
+def head_sway(rows, idx, start, release, frame):
+    """Sideways head travel from set-up to just after release, in shoulder widths. Smoothed (3-sample median)
+    and measured as the 10th-90th percentile range, so one jittery pose frame can't fake a big sway."""
+    if not frame[0]:
+        return None
+    order = sorted(idx)
+    lo = start if start is not None else order[0]
+    hi = (release + 1) if release is not None else order[-1]
+    xs = [rows[i]['points']['head'][0] for i in order if lo <= i <= hi and rows[i]['points'].get('head') is not None]
+    if len(xs) < 3:
+        return None
+    sm = [float(np.median(xs[max(0, k - 1):k + 2])) for k in range(len(xs))]
+    return round(float(np.percentile(sm, 90) - np.percentile(sm, 10)) / frame[0], 3)
+
+
 def front_metrics(rows, indices, phases, frame):
     """Front-on metrics for one throw window (see constants above). Missing values are None."""
     idx = set(int(i) for i in indices)
@@ -911,8 +949,7 @@ def front_metrics(rows, indices, phases, frame):
     if e_r is not None and w_r is not None and frame[0]:
         dx, dy = (w_r[0] - e_r[0]) * frame[1], e_r[1] - w_r[1]
         forearm = round(float(np.degrees(np.arctan2(dx, max(abs(dy), 1e-6)))), 1)  # + = hand outside the elbow
-    heads = [rows[i]['points']['head'][0] for i in sorted(idx) if rows[i]['points'].get('head') is not None]
-    sway = round(float(np.ptp(heads)) / frame[0], 3) if len(heads) >= 3 and frame[0] else None
+    sway = head_sway(rows, idx, s, r, frame)
     ts, tr = _tilt(rows, s), _tilt(rows, r)
     lean = round(tr - ts, 1) if ts is not None and tr is not None else None
     return {'elbow_flare': lateral(e_r, sh_r, frame), 'wrist_line_release': lateral(w_r, sh_w, frame),
@@ -928,14 +965,15 @@ def front_observations(m):
     if fl is not None and fl > FRONT_FLARE_HIGH:
         obs.append(('release', f'Your elbow flared out at release ({fl * 100:.0f}% of a shoulder width outside your '
                                'shoulder line). Keep the elbow tucked under the dart so the arm swings straight.'))
-    elif wl is not None and abs(wl) > FRONT_LINE_HIGH:
-        side = 'outside' if wl > 0 else 'inside'
-        obs.append(('release', f'Your hand released {abs(wl) * 100:.0f}% of a shoulder width {side} your shoulder line. '
+    elif wl is not None and (wl > FRONT_AIM_OUT or wl < FRONT_AIM_IN):
+        side = 'outside your shoulder' if wl > 0 else 'across your body, past your aiming eye'
+        obs.append(('release', f'Your hand released {abs(wl) * 100:.0f}% of a shoulder width {side}. '
                                'Line the dart, hand and elbow up under your aiming eye.'))
-    if ft is not None and ft < -FRONT_CROSS_HIGH:
+    fr = ft - wl if ft is not None and wl is not None else ft  # follow-through vs the release line
+    if fr is not None and fr < -FRONT_CROSS_HIGH:
         obs.append(('follow_through', 'Your hand finished across your body. Follow through straight at the target '
                                       'rather than pulling it in.'))
-    elif ft is not None and ft > FRONT_OUT_HIGH:
+    elif fr is not None and fr > FRONT_OUT_HIGH:
         obs.append(('follow_through', 'Your hand finished out wide. Point your follow-through straight at the '
                                       'target, not out to the side.'))
     if sw is not None and sw > FRONT_SWAY_HIGH:
@@ -971,8 +1009,8 @@ def front_session_tips(throws, method, arm_detected_pct=None):
         tips.append('Throws were not detected automatically, so these windows may not line up with each throw. '
                     'Trim idle time and keep the camera still, then try again.')
     rel = [t['wrist_line_release'] for t in throws if t.get('wrist_line_release') is not None]
-    if len(rel) >= 2:
-        spread = max(rel) - min(rel)
+    if len(rel) >= 2:  # 10th-90th percentile range: one mis-tracked throw shouldn't decide it
+        spread = float(np.percentile(rel, 90) - np.percentile(rel, 10)) if len(rel) >= 5 else max(rel) - min(rel)
         if spread > FRONT_RELEASE_SPREAD_HIGH:
             tips.append(f'Your release point moved sideways by {spread * 100:.0f}% of a shoulder width across throws. '
                         'A repeatable line is what tightens left-right grouping.')
@@ -998,5 +1036,5 @@ def front_caption(m, phase):
     if phase == 'backswing':
         return 'Take-back: keep the hand on the same line as the elbow.'
     if phase == 'release':
-        return f"Release: elbow {fmt(m.get('elbow_flare'))}, hand {fmt(m.get('wrist_line_release'))} of the shoulder line."
+        return f"Release: elbow {fmt(m.get('elbow_flare'))}, hand {fmt(m.get('wrist_line_release'))} of the shoulder line (under the eye is about 20-50% in)."
     return f"Follow-through: hand finishes {fmt(m.get('follow_through_lateral'))} of the shoulder line."

@@ -21,7 +21,7 @@ from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_
                       pick_phases, segment_throws, session_tips, summarise_throw, throw_mechanics, throw_tips)
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 
-VERSION = '0.8.2'
+VERSION = '0.8.3'
 log = logging.getLogger('oche.detect')
 logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
@@ -127,6 +127,7 @@ def extract_rows(path, arm='right', on_progress=None):
                 conf = round(float(np.mean([lm[keys[k]].visibility for k in ('shoulder', 'elbow', 'wrist')])), 3)
             row = make_row(idx, fps, coords)
             row['conf'] = conf
+            row['aspect'] = round(w / h, 4) if h else None  # upright frame width / height (front-on body scale)
             rows.append(row)
             idx += 1
             if on_progress and len(rows) % 10 == 0:
@@ -221,10 +222,11 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
             'view':view,
             'session_tips':(front_session_tips if view == 'front' else session_tips)(summaries, seg['method'], arm_pct),
             'tips_note':TIPS_NOTE,
-            'measurement_note':('Front-on: sideways offsets are in shoulder widths (+ = out from the body); elbow drop and '
-                                'elbow/release angles are side-on measurements and are not reported. ' if view == 'front' else '')
+            'measurement_note':('Front-on: sideways offsets are in shoulder widths (+ = out from the body; the width is corrected for an '
+                                'angled stance using torso length). Elbow drop, elbow/release angles and take-back timing are '
+                                'side-on measurements and are not reported. ' if view == 'front' else '')
                                + '2D normalized image coordinates; camera perspective and body size affect values. Not validated as coaching advice.',
-            'not_measured':(['elbow_drop', 'release_angle', 'follow_through_angle'] if view == 'front' else []),
+            'not_measured':(['elbow_drop', 'release_angle', 'follow_through_angle', 'tempo'] if view == 'front' else []),
             'throws':summaries, 'timeline':timeline, 'overlay_url':overlay_url, 'overlay_note':overlay_note,
             'trajectory':[{'time_s':r['time_s'], 'head':r['points']['head'], 'elbow':r['points']['elbow'],
                            'wrist':r['points']['wrist'], 'elbow_angle_deg':r['elbow_angle_deg']}
