@@ -18,10 +18,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_session_tips, front_throw_tips,
-                      pick_phases, segment_throws, session_tips, summarise_throw, throw_mechanics, throw_tips)
+                      pick_phases, segment_throws, session_tips, summarise_throw, throw_details, throw_mechanics, throw_tips)
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 
-VERSION = '0.8.3'
+VERSION = '0.9.0'
 log = logging.getLogger('oche.detect')
 logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
@@ -170,7 +170,13 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
         for t, sg in zip(summaries, seg['segments']):
             t.update(front_metrics(rows, sg['indices'], pick_phases(rows, sg['indices'], sg['peak_index'], seg['wrist_speed']), frame))
     for t, sg in zip(summaries, seg['segments']):  # phase-by-phase angles and timing for the detailed review
-        t['mechanics'] = throw_mechanics(rows, sg['indices'], pick_phases(rows, sg['indices'], sg['peak_index'], seg['wrist_speed']), view)
+        ph = pick_phases(rows, sg['indices'], sg['peak_index'], seg['wrist_speed'])
+        t['mechanics'] = throw_mechanics(rows, sg['indices'], ph, view)
+        try:  # detailed breakdown is additive: a failure here must never break the analysis
+            t['mechanics']['detail'] = throw_details(rows, sg['indices'], ph, view, frame)
+        except Exception:  # pragma: no cover
+            log.exception('throw_details failed')
+            t['mechanics']['detail'] = None
     for t, tips in zip(summaries, (front_throw_tips if view == 'front' else throw_tips)(summaries)):
         t['tips'] = tips
     if view == 'front':  # elbow angles are foreshortened from the front: not reported
@@ -252,7 +258,7 @@ def analyse(path, arm='right', overlay=False, view='side', max_throws=None, repo
 
 @app.get('/health')
 def health():
-    return {'ok':True, 'version':VERSION, 'views':list(VIEWS), 'features':['job_progress', 'mechanics']}
+    return {'ok':True, 'version':VERSION, 'views':list(VIEWS), 'features':['job_progress', 'mechanics', 'mechanics_detail']}
 
 
 @app.get('/analysis/{analysis_id}/frames/{name}')

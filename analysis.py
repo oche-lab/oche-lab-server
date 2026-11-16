@@ -764,6 +764,181 @@ def throw_mechanics(rows, indices, phases, view='side'):
             'body_shift': shift}
 
 
+# ---- detailed mechanics (additive, 0.9.0) ----------------------------------------------------------------
+# Per-throw values for the app's "Mechanics breakdown". Lengths are body-relative: side-on in upper-arm lengths
+# ('ul'), front-on in shoulder widths ('sw'), so they don't depend on how far the camera is. Point tracks are
+# smoothed with a 3-sample median first. Anything the camera angle can't see is None (never a guess).
+HOLD_TOL = 0.15        # wrist within this many units of its take-back / follow-through position = "holding"
+
+
+def _track(rows, order, key):
+    """{row index: smoothed (x, y)} for one landmark over the throw window (3-sample median)."""
+    pts = [(i, rows[i]['points'].get(key)) for i in order]
+    pts = [(i, p) for i, p in pts if p is not None]
+    out = {}
+    for k, (i, _) in enumerate(pts):
+        win = [p for _, p in pts[max(0, k - 1):k + 2]]
+        out[i] = (float(np.median([p[0] for p in win])), float(np.median([p[1] for p in win])))
+    return out
+
+
+def _at(track, i, order, k=2):
+    """Track value at row i or the nearest row within k samples."""
+    if i is None:
+        return None
+    pos = {r: n for n, r in enumerate(order)}
+    if i not in pos:
+        return None
+    for d in range(k + 1):
+        for j in (pos[i] - d, pos[i] + d):
+            if 0 <= j < len(order) and order[j] in track:
+                return track[order[j]]
+    return None
+
+
+def _extent(track, rows_in):
+    """10th-90th percentile extent of a smoothed track over the given rows: (dx, dy, euclid)."""
+    pts = [track[i] for i in rows_in if i in track]
+    if len(pts) < 3:
+        return None
+    a = np.array(pts)
+    dx = float(np.percentile(a[:, 0], 90) - np.percentile(a[:, 0], 10))
+    dy = float(np.percentile(a[:, 1], 90) - np.percentile(a[:, 1], 10))
+    return dx, dy, float(np.hypot(dx, dy))
+
+
+def _hold(track, order, i, unit, rows, forward=True):
+    """Seconds the wrist stays within HOLD_TOL units of its position at row i (contiguous, one direction)."""
+    if i is None or i not in track or not unit:
+        return None
+    p0, pos = track[i], order.index(i)
+    seq = order[pos:] if forward else order[:pos + 1][::-1]
+    last = i
+    for j in seq:
+        if j not in track:
+            continue
+        if np.hypot(track[j][0] - p0[0], track[j][1] - p0[1]) / unit > HOLD_TOL:
+            break
+        last = j
+    return round(abs(rows[last]['time_s'] - rows[i]['time_s']), 3)
+
+
+def throw_details(rows, indices, phases, view='side', frame=None):
+    """Detailed per-throw mechanics (see block comment above). All keys always present; unmeasurable = None."""
+    order = sorted(int(i) for i in indices)
+    front = view == 'front'
+    sh, el, wr = _track(rows, order, 'shoulder'), _track(rows, order, 'elbow'), _track(rows, order, 'wrist')
+    hd, osh = _track(rows, order, 'head'), _track(rows, order, 'other_shoulder')
+    hip, ohip = _track(rows, order, 'hip'), _track(rows, order, 'other_hip')
+    ul = [np.hypot(el[i][0] - sh[i][0], el[i][1] - sh[i][1]) for i in order if i in el and i in sh]
+    if front:
+        unit = frame[0] if frame and frame[0] else None
+        out_sign = frame[1] if frame else 1.0
+    else:
+        unit = float(np.median(ul)) if ul else None
+        out_sign = 1.0
+    s_i, b_i, r_i, f_i = (phases.get(k) for k in ('setup', 'backswing', 'release', 'follow_through'))
+    T = lambda i: rows[i]['time_s'] if i is not None else None
+    U = lambda v: None if v is None or not unit else round(float(v) / unit, 3)
+    # which way is "towards the board" side-on: where the hand ends up relative to the shoulder after release
+    fwd = 1.0
+    a_sh, a_w = _at(sh, f_i if f_i is not None else r_i, order), _at(wr, f_i if f_i is not None else r_i, order)
+    if a_sh and a_w and abs(a_w[0] - a_sh[0]) > 1e-6:
+        fwd = 1.0 if a_w[0] > a_sh[0] else -1.0
+    hsign = out_sign if front else fwd
+    pre = [i for i in order if (s_i if s_i is not None else order[0]) <= i <= (r_i if r_i is not None else order[-1])]
+    post = [i for i in order if r_i is not None and i >= r_i]
+
+    # pull-back
+    pb = {'elbow_deg': None, 'depth_deg': None, 'hand_dist': None, 'duration_s': None, 'pause_s': None, 't': T(b_i)}
+    if not front and b_i is not None:
+        pb['elbow_deg'] = _r(_angle(rows, b_i))
+        a_s = _angle(rows, s_i) if s_i is not None else None
+        pb['depth_deg'] = _r(a_s - pb['elbow_deg']) if a_s is not None and pb['elbow_deg'] is not None else None
+        p_s, p_w = _at(sh, b_i, order), _at(wr, b_i, order)
+        pb['hand_dist'] = U(np.hypot(p_w[0] - p_s[0], p_w[1] - p_s[1])) if p_s and p_w else None
+        pb['duration_s'] = _r(T(b_i) - T(s_i), 3) if s_i is not None else None
+        h1, h2 = _hold(wr, order, b_i, unit, rows, True), _hold(wr, order, b_i, unit, rows, False)
+        pb['pause_s'] = _r((h1 or 0) + (h2 or 0), 3) if h1 is not None or h2 is not None else None
+
+    # elbow height (+ = above the shoulder), side-on only
+    eh = {'setup': None, 'backswing': None, 'release': None, 'change': None, 'travel': None, 't': T(r_i)}
+    if not front:
+        for name, i in (('setup', s_i), ('backswing', b_i), ('release', r_i)):
+            a, b = _at(sh, i, order), _at(el, i, order)
+            eh[name] = U(a[1] - b[1]) if a and b else None
+        ref = eh['backswing'] if eh['backswing'] is not None else eh['setup']
+        eh['change'] = _r(eh['release'] - ref, 3) if ref is not None and eh['release'] is not None else None
+        ys = [(sh[i][1] - el[i][1]) for i in pre if i in sh and i in el]
+        eh['travel'] = U(max(ys) - min(ys)) if len(ys) >= 3 else None
+
+    # head
+    hm = {'travel_pre': None, 'travel_post': None, 'dx': None, 'dy': None, 't': T(r_i)}
+    e1, e2 = _extent(hd, pre), _extent(hd, post)
+    if e1:
+        hm['travel_pre'] = U(e1[2])
+    if e2:
+        hm['travel_post'] = U(e2[2])
+    h_s, h_r = _at(hd, s_i if s_i is not None else (pre[0] if pre else None), order), _at(hd, r_i, order)
+    if h_s and h_r:
+        hm['dx'] = U((h_r[0] - h_s[0]) * hsign)   # side: + = towards the board; front: + = outward
+        hm['dy'] = U(h_s[1] - h_r[1])             # + = head rose
+
+    # release
+    rl = {'height': None, 'angle_deg': None, 'elbow_deg': None, 'timing_s': None, 'lateral': None, 't': T(r_i)}
+    if r_i is not None:
+        a, w = _at(sh, r_i, order), _at(wr, r_i, order)
+        rl['height'] = U(a[1] - w[1]) if a and w else None
+        if not front:
+            e = _at(el, r_i, order)
+            if e and w:
+                rl['angle_deg'] = _r(np.degrees(np.arctan2(e[1] - w[1], abs(w[0] - e[0]) + 1e-9)))
+            rl['elbow_deg'] = _r(_angle(rows, r_i))
+            rl['timing_s'] = _r(T(r_i) - T(b_i), 3) if b_i is not None else None
+        elif a and w:
+            rl['lateral'] = U((w[0] - a[0]) * out_sign)
+
+    # body
+    def mid(tr1, tr2, i):
+        p, q = _at(tr1, i, order), _at(tr2, i, order)
+        return ((p[0] + q[0]) / 2, (p[1] + q[1]) / 2) if p and q else (p or q)
+    def lean(i):  # torso angle from vertical, + = leaning towards the board (side) / outward (front)
+        a, b = mid(sh, osh, i), mid(hip, ohip, i)
+        if not a or not b or abs(b[1] - a[1]) < 1e-6:
+            return None
+        return float(np.degrees(np.arctan2((a[0] - b[0]) * hsign, b[1] - a[1])))
+    def hipx(i):
+        m = mid(hip, ohip, i)
+        return m[0] if m else None
+    bd = {'lean_setup_deg': None, 'lean_release_deg': None, 'lean_change_deg': None, 'shoulder_sway': None,
+          'hip_sway': None, 'shift_pre': None, 'shift_during': None, 'shift_after': None, 'shoulder_tilt_deg': None,
+          't': T(r_i)}
+    l_s, l_r = lean(s_i), lean(r_i)
+    bd['lean_setup_deg'], bd['lean_release_deg'] = _r(l_s), _r(l_r)
+    bd['lean_change_deg'] = _r(l_r - l_s) if l_s is not None and l_r is not None else None
+    e = _extent(sh, pre)
+    bd['shoulder_sway'] = U(e[0]) if e else None
+    hips_track = {i: mid(hip, ohip, i) for i in order if mid(hip, ohip, i)}
+    e = _extent(hips_track, pre)
+    bd['hip_sway'] = U(e[0]) if e else None
+    x0, xs, xr, xe = hipx(order[0]), hipx(s_i), hipx(r_i), hipx(order[-1])
+    sh_ = lambda a, b: U((b - a) * hsign) if a is not None and b is not None else None
+    bd['shift_pre'], bd['shift_during'], bd['shift_after'] = sh_(x0, xs), sh_(xs, xr), sh_(xr, xe)
+    if front:
+        bd['shoulder_tilt_deg'] = _r(_tilt(rows, r_i))
+
+    # follow-through
+    ft = {'extension_deg': None, 'hold_s': None, 'direction': None, 't': T(f_i)}
+    if f_i is not None:
+        ft['extension_deg'] = None if front else _r(_angle(rows, f_i))
+        ft['hold_s'] = _hold(wr, order, f_i, unit, rows, True)
+        if front:
+            a, w = _at(sh, f_i, order), _at(wr, f_i, order)
+            ft['direction'] = U((w[0] - a[0]) * out_sign) if a and w else None
+    return {'unit': 'sw' if front else 'ul', 'pullback': pb, 'elbow': eh, 'head': hm, 'release': rl, 'body': bd,
+            'follow': ft}
+
+
 def _fmt_deg(a):
     return f'{a:.0f}°' if a is not None else 'not tracked'
 
