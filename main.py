@@ -21,7 +21,7 @@ from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_
                       pick_phases, segment_throws, session_tips, summarise_throw, throw_details, throw_mechanics, throw_tips)
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 
-VERSION = '0.9.1'
+VERSION = '0.9.2'
 log = logging.getLogger('oche.detect')
 logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
@@ -257,41 +257,78 @@ def analyse(path, arm='right', overlay=False, view='side', max_throws=None, repo
 
 
 # Tester invite page: a tappable https link (WhatsApp won't link exp://) that hands off to Expo Go.
-EXPO_GO_URL = 'exp://u.expo.dev/9627303a-4e67-4ff7-9faa-ce2bc73ee28d?runtime-version=exposdk%3A58.0.0&channel-name=main'
+# Expo Go registers the exp:// and exps:// schemes (exps = https). Its only https universal links are
+# expo.dev/expo-go (opens Expo Go's home) and legacy exp.host/@owner/slug, so EAS Update URLs need a scheme.
+EXPO_UPDATE_PATH = 'u.expo.dev/9627303a-4e67-4ff7-9faa-ce2bc73ee28d?runtime-version=exposdk%3A58.0.0&channel-name=main'
+EXPO_GO_URL = 'exp://' + EXPO_UPDATE_PATH     # the form Expo's own QR codes use for EAS Update
+EXPO_GO_URL_ALT = 'exps://' + EXPO_UPDATE_PATH  # same manifest, explicitly over https
+EXPO_GO_HOME = 'https://expo.dev/expo-go'       # universal link: opens Expo Go, else its store page
+EXPO_GO_IOS = 'https://apps.apple.com/app/expo-go/id982107779'
+EXPO_GO_ANDROID = 'https://play.google.com/store/apps/details?id=host.exp.exponent'
 OPEN_PAGE = """<!doctype html><html lang="en-GB"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Open Oche Lab</title><meta name="theme-color" content="#0a0a0b">
 <meta property="og:title" content="Oche Lab: AI darts coach"><meta property="og:description" content="Tap to open the Oche Lab beta in Expo Go.">
 <style>
 *{box-sizing:border-box}html,body{margin:0;background:#0a0a0b;color:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
-main{max-width:440px;margin:0 auto;padding:56px 22px 40px;text-align:center}
+main{max-width:440px;margin:0 auto;padding:44px 22px 40px;text-align:center}
 .mark{font-size:46px;font-weight:900;letter-spacing:-1px;color:#ff2d3d;text-shadow:0 0 12px rgba(255,45,61,.75),0 0 32px rgba(255,45,61,.45);margin:0}
-.tag{color:#a1a1aa;margin:10px 0 30px;font-size:15px}
-.btn{display:block;background:#ff2d3d;color:#0a0a0b;font-size:20px;font-weight:800;text-decoration:none;padding:19px 22px;border-radius:16px;box-shadow:0 0 26px rgba(255,45,61,.55)}
-.btn:active{transform:scale(.98)}
-ol{text-align:left;background:#141416;border:1px solid #26262b;border-radius:16px;padding:18px 18px 18px 40px;margin:28px 0 18px;line-height:1.55;font-size:15px}
-li{margin:6px 0}a.store{color:#ff5c69;font-weight:600}
-.note{font-size:13px;color:#a1a1aa;line-height:1.5;border-left:3px solid #ff2d3d;text-align:left;padding:4px 0 4px 12px}
-.raw{margin-top:26px;font-size:11px;color:#52525b;word-break:break-all}
+.tag{color:#a1a1aa;margin:10px 0 24px;font-size:15px}
+.banner{display:none;background:#2a0b0e;border:1px solid #ff2d3d;border-radius:14px;padding:14px 16px;margin:0 0 20px;text-align:left;font-size:15px;line-height:1.5}
+.banner b{color:#ff5c69}
+.btn{display:block;width:100%;background:#ff2d3d;color:#0a0a0b;font-size:20px;font-weight:800;text-decoration:none;padding:19px 22px;border-radius:16px;box-shadow:0 0 26px rgba(255,45,61,.55);border:0;font-family:inherit}
+.btn2{display:block;width:100%;margin-top:12px;background:transparent;color:#ff5c69;font-size:16px;font-weight:700;text-decoration:none;padding:14px;border-radius:14px;border:1.5px solid #ff2d3d;font-family:inherit}
+.btn:active,.btn2:active{transform:scale(.98)}
+h2{font-size:16px;margin:30px 0 8px;text-align:left;color:#f4f4f5}
+ol{text-align:left;background:#141416;border:1px solid #26262b;border-radius:16px;padding:16px 16px 16px 38px;margin:0;line-height:1.55;font-size:15px}
+li{margin:6px 0}ol a{color:#ff5c69;font-weight:600}
+.note{font-size:13px;color:#a1a1aa;line-height:1.5;border-left:3px solid #ff2d3d;text-align:left;padding:4px 0 4px 12px;margin-top:22px}
+.raw{margin-top:22px;font-size:11px;color:#71717a;word-break:break-all;user-select:all;-webkit-user-select:all}
+#copied{color:#4ade80;font-size:14px;min-height:20px;margin-top:8px}
 </style></head><body><main>
-<h1 class="mark">Oche Lab</h1><p class="tag" id="status">Opening in Expo Go&hellip;</p>
-<a class="btn" href="__URL__">Open in Expo Go</a>
+<h1 class="mark">Oche Lab</h1><p class="tag">AI darts coach &middot; beta</p>
+<div class="banner" id="inapp">You&rsquo;re in an app&rsquo;s built-in browser, which blocks opening other apps. Tap <b>&middot;&middot;&middot;</b> (or the compass or globe icon), then <b>Open in Safari</b> (or your browser) first. Then tap the red button.</div>
+<a class="btn" id="open" href="__URL__">Open in Expo Go</a>
+<a class="btn2" href="__ALT__">Didn&rsquo;t open? Try the alternative link</a>
+<button class="btn2" id="copy" type="button">Copy link</button>
+<div id="copied" aria-live="polite"></div>
+
+<h2>First time?</h2>
 <ol>
-<li>Install <b>Expo Go</b>: <a class="store" href="https://apps.apple.com/app/expo-go/id982107779">App Store</a> or <a class="store" href="https://play.google.com/store/apps/details?id=host.exp.exponent">Google Play</a>.</li>
+<li>Install <b>Expo Go</b>: <a href="__IOS__">App Store</a> or <a href="__ANDROID__">Google Play</a>.</li>
 <li>Open Expo Go and sign in with the Expo account you were added with.</li>
 <li>Come back here and tap <b>Open in Expo Go</b>.</li>
 </ol>
-<p class="note">If Expo Go says <b>&ldquo;requires authentication&rdquo;</b>, you haven&rsquo;t been added yet. Message the person who sent you this link.</p>
-<p class="raw">__URL__</p>
-</main><script>setTimeout(function(){location.href="__URL__"},400);
-setTimeout(function(){var s=document.getElementById("status");if(s)s.textContent="Didn\\u2019t open? Tap the button below.";},2500);</script>
-</body></html>""".replace('__URL__', EXPO_GO_URL)
+
+<h2>Still nothing? Paste the link instead</h2>
+<ol>
+<li>Tap <b>Copy link</b> above.</li>
+<li>Open <b>Safari</b>, tap the address bar, paste and tap <b>Go</b>. Choose <b>Open</b> if it asks to open Expo Go.</li>
+<li>On Android you can also open Expo Go (<a href="__HOME__">open it here</a>), tap <b>Enter URL manually</b> and paste.</li>
+</ol>
+<p class="note">If Expo Go says <b>&ldquo;requires authentication&rdquo;</b>, you haven&rsquo;t been added yet, or you&rsquo;re signed in with a different account. Message the person who sent you this link.<br><br>Once it&rsquo;s opened once, Oche Lab stays in Expo Go under <b>Recently opened</b>.</p>
+<p class="raw" id="raw">__URL__</p>
+</main><script>
+(function(){
+  var URL="__URL__", ua=navigator.userAgent||"";
+  var inApp=/FBAN|FBAV|FB_IAB|FBIOS|Instagram|Twitter|Line\\/|WhatsApp|Snapchat|LinkedInApp|Pinterest|TikTok|musical_ly|BytedanceWebview|GSA\\/|MicroMessenger|Messenger|Gmail|GoogleApp|KAKAOTALK|\\bwv\\b/i.test(ua);
+  var iosWebView=/(iPhone|iPod|iPad).*AppleWebKit(?!.*Safari)/i.test(ua) && !/CriOS|FxiOS|EdgiOS/i.test(ua);
+  if(inApp||iosWebView){document.getElementById("inapp").style.display="block";}
+  function done(ok){document.getElementById("copied").textContent=ok?"Copied. Now paste it into Safari\\u2019s address bar.":"Press and hold the link at the bottom to copy it.";}
+  function fallback(){var t=document.createElement("textarea");t.value=URL;t.setAttribute("readonly","");t.style.position="fixed";t.style.opacity="0";document.body.appendChild(t);t.select();t.setSelectionRange(0,URL.length);var ok=false;try{ok=document.execCommand("copy");}catch(e){}document.body.removeChild(t);done(ok);}
+  document.getElementById("copy").addEventListener("click",function(){
+    if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(URL).then(function(){done(true);},fallback);}else{fallback();}
+  });
+})();
+</script>
+</body></html>""".replace('__URL__', EXPO_GO_URL).replace('__ALT__', EXPO_GO_URL_ALT).replace('__HOME__', EXPO_GO_HOME) \
+    .replace('__IOS__', EXPO_GO_IOS).replace('__ANDROID__', EXPO_GO_ANDROID)
 
 
 @app.get('/open', response_class=HTMLResponse)
 @app.get('/try', response_class=HTMLResponse, include_in_schema=False)
 def open_in_expo_go():
-    return HTMLResponse(OPEN_PAGE, headers={'Cache-Control':'public, max-age=300'})
+    return HTMLResponse(OPEN_PAGE, headers={'Cache-Control':'no-cache'})
 
 
 @app.get('/health')
