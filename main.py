@@ -12,7 +12,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
@@ -20,8 +20,9 @@ from fastapi.responses import FileResponse, HTMLResponse
 from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_session_tips, front_throw_tips,
                       pick_phases, segment_throws, session_tips, summarise_throw, throw_details, throw_mechanics, throw_tips)
 from annotate import open_video, render_key_frames, render_overlay_video, upright
+import guard
 
-VERSION = '0.9.2'
+VERSION = '0.9.3'
 log = logging.getLogger('oche.detect')
 logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
@@ -41,6 +42,7 @@ MAX_SECONDS = 75               # clips up to ~1 minute (with a little slack)
 
 # Per-analysis review assets (annotated JPEGs, optional overlay MP4) live in a temp dir keyed by id.
 RESULTS_ROOT = Path(os.environ.get('OCHELAB_RESULTS_DIR', Path(tempfile.gettempdir()) / 'ochelab_results'))
+UPLOADS_ROOT = Path(os.environ.get('OCHELAB_UPLOADS_DIR', Path(tempfile.gettempdir()) / 'ochelab_uploads'))
 RESULT_TTL_S = 60 * 60          # assets are deleted after an hour
 MAX_STORED_ANALYSES = 20        # and only the newest N analyses are kept
 ID_RE = re.compile(r'^[0-9a-f]{32}$')
@@ -57,6 +59,21 @@ def cleanup_results(now=None):
     for k, d in enumerate(dirs):
         if k >= MAX_STORED_ANALYSES or now - d.stat().st_mtime > RESULT_TTL_S:
             shutil.rmtree(d, ignore_errors=True)
+
+
+def cleanup_disk():
+    """If results + uploads exceed the disk budget, drop the oldest stored analyses first."""
+    if not guard.cfg('disk_budget'):
+        return
+    paths = [RESULTS_ROOT, UPLOADS_ROOT]
+    if not guard.over_budget(paths) or not RESULTS_ROOT.exists():
+        return
+    dirs = sorted((d for d in RESULTS_ROOT.iterdir() if d.is_dir() and ID_RE.match(d.name)),
+                  key=lambda d: d.stat().st_mtime)
+    for d in dirs:
+        if not guard.over_budget(paths):
+            break
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def angle(a, b, c):
@@ -333,7 +350,7 @@ def open_in_expo_go():
 
 @app.get('/health')
 def health():
-    return {'ok':True, 'version':VERSION, 'views':list(VIEWS), 'features':['job_progress', 'mechanics', 'mechanics_detail']}
+    return {'ok':True, 'version':VERSION, 'views':list(VIEWS), 'features':['job_progress', 'mechanics', 'mechanics_detail', 'queue_position', 'job_retry', 'install_id']}
 
 
 @app.get('/analysis/{analysis_id}/frames/{name}')
@@ -365,6 +382,13 @@ EXECUTOR = ThreadPoolExecutor(max_workers=1)
 def _set_job(job_id, **fields):
     with JOBS_LOCK:
         JOBS.setdefault(job_id, {}).update(fields, updated=time.time())
+        mem = dict(JOBS[job_id])
+    guard.save_job(job_id, **mem)
+    # Keep RAM small on the 512 MB host: once a result is on disk, drop it from memory.
+    if mem.get('status') in ('done', 'error', 'lost') and 'result' in mem:
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id].pop('result', None)
 
 
 def _run_job(job_id, path, arm, overlay, view='side', max_throws=None):
@@ -382,13 +406,53 @@ def _run_job(job_id, path, arm, overlay, view='side', max_throws=None):
             os.unlink(path)
         except OSError:
             pass
+        _set_job(job_id, upload_path=None)
 
 
 def _prune_jobs(now=None):
     now = now or time.time()
+    expired = set(guard.prune_jobs(JOB_TTL_S, now))
     with JOBS_LOCK:
-        for k in [k for k, j in JOBS.items() if now - j.get('updated', now) > JOB_TTL_S]:
+        for k in [k for k, j in JOBS.items() if k in expired or now - j.get('updated', now) > JOB_TTL_S]:
             del JOBS[k]
+
+
+def recover_jobs():
+    """Reload job metadata from local SQLite. In-flight work cannot resume after a restart
+    (uploads and the worker thread are gone, and Render's disk is ephemeral across instances),
+    so those jobs are marked lost and the app resubmits automatically."""
+    guard.ensure_configured()
+    UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
+    RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
+    for job in guard.all_jobs():
+        jid = job['id']
+        if job.get('status') in ('queued', 'running'):
+            path = job.get('upload_path')
+            guard.save_job(jid, status='lost', error=guard.LOST_DETAIL['message'], retry=True)
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        elif job.get('status') in ('done', 'error'):
+            slim = {k: v for k, v in job.items() if k not in ('result', 'id')}
+            with JOBS_LOCK:
+                JOBS[jid] = slim
+    if UPLOADS_ROOT.exists():
+        for f in UPLOADS_ROOT.iterdir():
+            if f.is_file():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+    _prune_jobs()
+    cleanup_results()
+    cleanup_disk()
+
+
+@app.on_event('startup')
+def _startup():
+    recover_jobs()
 
 
 async def _save_upload(video, arm):
@@ -398,49 +462,104 @@ async def _save_upload(video, arm):
     suffix = Path(video.filename or 'throw.mp4').suffix.lower()
     if suffix not in {'.mp4','.mov','.m4v'}:
         raise HTTPException(400, 'Please upload MP4 or MOV video.')
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        path = tmp.name
-        size = 0
-        try:
+    UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
+    path = str(UPLOADS_ROOT / f'{uuid.uuid4().hex}{suffix}')
+    size = 0
+    try:
+        with open(path, 'wb') as tmp:
             while chunk := await video.read(1024*1024):
                 size += len(chunk)
                 if size > MAX_BYTES:
                     raise HTTPException(413, 'Video exceeds 150 MB prototype limit.')
                 tmp.write(chunk)
-        except Exception:
+    except Exception:
+        try:
             os.unlink(path)
-            raise
+        except OSError:
+            pass
+        raise
     return path, arm
 
 
+def _busy():
+    raise HTTPException(429, "The analysis server is busy right now. Please try again in a minute.",
+                        headers={'Retry-After': '60'})
+
+
 @app.post('/analyse')
-async def analyse_video(video: UploadFile = File(...), arm: str = Form('right'), overlay: bool = Form(False),
+async def analyse_video(request: Request, video: UploadFile = File(...), arm: str = Form('right'), overlay: bool = Form(False),
                         mode: str = Form('sync'), view: str = Form('side'), max_throws: int = Form(0)):
+    client = guard.authorize(request)
     view = (view or 'side').strip().lower()
     if view not in VIEWS:
         raise HTTPException(400, "view must be 'side' or 'front'.")
     max_throws = max_throws if 0 < max_throws <= 60 else None  # app sends darts marked on board photos / 3 per visit
+    guard.check_rate(client)
+    if mode == 'job':
+        guard.check_queue_capacity()
     path, arm = await _save_upload(video, arm)
     cleanup_results()
+    cleanup_disk()
+    if guard.over_budget([RESULTS_ROOT, UPLOADS_ROOT]):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        _busy()
     if mode == 'job':
-        _prune_jobs()
-        job_id = uuid.uuid4().hex
-        _set_job(job_id, status='queued', stage='queued', stage_label=STAGE_LABELS['queued'], progress=0.0)
-        EXECUTOR.submit(_run_job, job_id, path, arm, overlay, view, max_throws)
-        return {'job_id': job_id, 'status': 'queued'}
+        try:
+            _prune_jobs()
+            job_id = uuid.uuid4().hex
+            guard.record_analysis(client)
+            _set_job(job_id, status='queued', stage='queued', stage_label=STAGE_LABELS['queued'], progress=0.0,
+                     install_id=client.install_id, ip=client.ip, upload_path=path)
+            EXECUTOR.submit(_run_job, job_id, path, arm, overlay, view, max_throws)
+            out = {'job_id': job_id, 'status': 'queued'}
+            pos = guard.queue_position(job_id)
+            if pos:
+                out['queue_position'] = pos
+            return out
+        except Exception:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
     try:
+        guard.record_analysis(client)
         return await run_in_threadpool(analyse, path, arm, overlay, view, max_throws)
     except ValueError as e:
         raise HTTPException(422, str(e))
     finally:
-        os.unlink(path)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 @app.get('/jobs/{job_id}')
-def get_job(job_id: str):
-    with JOBS_LOCK:
-        job = dict(JOBS.get(job_id) or {}) if ID_RE.match(job_id) else None
+def get_job(job_id: str, request: Request):
+    client = guard.authorize(request)
+    job = None
+    if ID_RE.match(job_id or ''):
+        with JOBS_LOCK:
+            job = dict(JOBS.get(job_id) or {})
+        if not job:
+            job = guard.load_job(job_id)
     if not job:
+        raise guard.lost_http()
+    if not guard.owns_job(job, client):
         raise HTTPException(404, 'Analysis not found. It may have expired; please try again.')
-    job.pop('updated', None)
+    if job.get('status') == 'lost':
+        raise guard.lost_http()
+    if job.get('status') == 'done' and 'result' not in job:
+        stored = guard.load_job(job_id) or {}
+        if 'result' in stored:
+            job['result'] = stored['result']
+    if job.get('status') == 'queued':
+        pos = guard.queue_position(job_id)
+        if pos:
+            job['queue_position'] = pos
+    for k in ('updated', 'created', 'install_id', 'ip', 'upload_path', 'id', 'retry'):
+        job.pop(k, None)
     return job
