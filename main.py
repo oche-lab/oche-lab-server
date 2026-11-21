@@ -15,13 +15,13 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_session_tips, front_throw_tips,
                       pick_phases, segment_throws, session_tips, summarise_throw, throw_details, throw_mechanics, throw_tips)
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 
-VERSION = '0.9.0'
+VERSION = '0.9.1'
 log = logging.getLogger('oche.detect')
 logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
@@ -254,6 +254,44 @@ def analyse(path, arm='right', overlay=False, view='side', max_throws=None, repo
     progress('pose')
     rows, fps = extract_rows(path, arm, on_progress=lambda f: progress('pose', f))
     return build_result(path, rows, fps, arm, overlay, view=view, max_throws=max_throws, progress=progress)
+
+
+# Tester invite page: a tappable https link (WhatsApp won't link exp://) that hands off to Expo Go.
+EXPO_GO_URL = 'exp://u.expo.dev/9627303a-4e67-4ff7-9faa-ce2bc73ee28d?runtime-version=exposdk%3A58.0.0&channel-name=main'
+OPEN_PAGE = """<!doctype html><html lang="en-GB"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Open Oche Lab</title><meta name="theme-color" content="#0a0a0b">
+<meta property="og:title" content="Oche Lab: AI darts coach"><meta property="og:description" content="Tap to open the Oche Lab beta in Expo Go.">
+<style>
+*{box-sizing:border-box}html,body{margin:0;background:#0a0a0b;color:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+main{max-width:440px;margin:0 auto;padding:56px 22px 40px;text-align:center}
+.mark{font-size:46px;font-weight:900;letter-spacing:-1px;color:#ff2d3d;text-shadow:0 0 12px rgba(255,45,61,.75),0 0 32px rgba(255,45,61,.45);margin:0}
+.tag{color:#a1a1aa;margin:10px 0 30px;font-size:15px}
+.btn{display:block;background:#ff2d3d;color:#0a0a0b;font-size:20px;font-weight:800;text-decoration:none;padding:19px 22px;border-radius:16px;box-shadow:0 0 26px rgba(255,45,61,.55)}
+.btn:active{transform:scale(.98)}
+ol{text-align:left;background:#141416;border:1px solid #26262b;border-radius:16px;padding:18px 18px 18px 40px;margin:28px 0 18px;line-height:1.55;font-size:15px}
+li{margin:6px 0}a.store{color:#ff5c69;font-weight:600}
+.note{font-size:13px;color:#a1a1aa;line-height:1.5;border-left:3px solid #ff2d3d;text-align:left;padding:4px 0 4px 12px}
+.raw{margin-top:26px;font-size:11px;color:#52525b;word-break:break-all}
+</style></head><body><main>
+<h1 class="mark">Oche Lab</h1><p class="tag" id="status">Opening in Expo Go&hellip;</p>
+<a class="btn" href="__URL__">Open in Expo Go</a>
+<ol>
+<li>Install <b>Expo Go</b>: <a class="store" href="https://apps.apple.com/app/expo-go/id982107779">App Store</a> or <a class="store" href="https://play.google.com/store/apps/details?id=host.exp.exponent">Google Play</a>.</li>
+<li>Open Expo Go and sign in with the Expo account you were added with.</li>
+<li>Come back here and tap <b>Open in Expo Go</b>.</li>
+</ol>
+<p class="note">If Expo Go says <b>&ldquo;requires authentication&rdquo;</b>, you haven&rsquo;t been added yet. Message the person who sent you this link.</p>
+<p class="raw">__URL__</p>
+</main><script>setTimeout(function(){location.href="__URL__"},400);
+setTimeout(function(){var s=document.getElementById("status");if(s)s.textContent="Didn\\u2019t open? Tap the button below.";},2500);</script>
+</body></html>""".replace('__URL__', EXPO_GO_URL)
+
+
+@app.get('/open', response_class=HTMLResponse)
+@app.get('/try', response_class=HTMLResponse, include_in_schema=False)
+def open_in_expo_go():
+    return HTMLResponse(OPEN_PAGE, headers={'Cache-Control':'public, max-age=300'})
 
 
 @app.get('/health')
