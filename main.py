@@ -563,3 +563,7 @@ def get_job(job_id: str, request: Request):
     for k in ('updated', 'created', 'install_id', 'ip', 'upload_path', 'id', 'retry'):
         job.pop(k, None)
     return job
+
+# Share clips are a separate module so they can land beside other server work.
+from shareclip import router as share_clip_router
+app.include_router(share_clip_router)
