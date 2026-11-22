@@ -22,7 +22,7 @@ from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 import guard
 
-VERSION = '0.9.3'
+VERSION = '0.9.4'
 log = logging.getLogger('oche.detect')
 logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
@@ -164,6 +164,12 @@ def make_row(frame_idx, fps, coords):
             'elbow_angle_deg': angle(shoulder, elbow, wrist), 'head_relative': head_relative}
 
 
+def frame_aspect(rows):
+    """Upright frame width / height (the overlay film and every normalised coordinate use this frame), or None."""
+    vals = [r['aspect'] for r in rows if r.get('aspect')]
+    return round(float(np.median(vals)), 4) if vals else None
+
+
 def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, view='side', max_throws=None, progress=None):
     """Segment throws, compute metrics/tips, render annotated key frames (+ optional overlay MP4)."""
     if len(rows) < 15:
@@ -251,6 +257,7 @@ def build_result(path, rows, fps, arm='right', overlay=False, analysis_id=None, 
                                + '2D normalized image coordinates; camera perspective and body size affect values. Not validated as coaching advice.',
             'not_measured':(['elbow_drop', 'release_angle', 'follow_through_angle', 'tempo'] if view == 'front' else []),
             'throws':summaries, 'timeline':timeline, 'overlay_url':overlay_url, 'overlay_note':overlay_note,
+            'frame_aspect':frame_aspect(rows),
             'trajectory':[{'time_s':r['time_s'], 'head':r['points']['head'], 'elbow':r['points']['elbow'],
                            'wrist':r['points']['wrist'], 'elbow_angle_deg':r['elbow_angle_deg']}
                           for r in rows[::max(1,len(rows)//120)]]}

@@ -569,13 +569,16 @@ def throw_path(subset):
 
     Lets the app draw the wrist path and compare upper-arm angle / release height between throws.
     Each item: t (s), s/e/w = shoulder/elbow/wrist [x, y] or None, a = elbow angle (deg) or None.
+    Since 0.9.4 (additive, for the app's "Show me" joint highlights): h = head, o = other shoulder, p = hip,
+    each [x, y] or None. Coordinates are normalised to the upright frame, the same frame as the overlay film.
     """
     out = []
     for r in subset:
         pts = r['points']
         a = r.get('elbow_angle_deg')
         out.append({'t': r['time_s'], 's': _pt(pts.get('shoulder')), 'e': _pt(pts.get('elbow')),
-                    'w': _pt(pts.get('wrist')), 'a': None if a is None else round(float(a), 1)})
+                    'w': _pt(pts.get('wrist')), 'a': None if a is None else round(float(a), 1),
+                    'h': _pt(pts.get('head')), 'o': _pt(pts.get('other_shoulder')), 'p': _pt(pts.get('hip'))})
     return out
 
 
