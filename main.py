@@ -22,7 +22,7 @@ from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 import guard
 
-VERSION = '0.9.4'
+VERSION = '0.9.5'
 log = logging.getLogger('oche.detect')
 logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on

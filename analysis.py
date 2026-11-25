@@ -557,6 +557,9 @@ def summarise_throw(rows, indices, number, peak_index=None, wrist_speed=None):
             'elbow_motion_normalized': _spread(elbow),
             'wrist_motion_normalized': _spread(wrist),
             'valid_frames': len(angles),
+            # Throw Lab confidence (0.9.5, additive): sampled frames in this throw's window and the % with a tracked elbow angle.
+            'window_frames': len(subset),
+            'tracked_pct': round(100.0 * len(angles) / len(subset), 1) if subset else None,
             'path': throw_path(subset)}
 
 
