@@ -22,7 +22,7 @@ from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 import guard
 
-VERSION = '0.9.7'
+VERSION = '0.9.8'
 log = logging.getLogger('oche.detect')
 logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
@@ -585,3 +585,7 @@ app.include_router(share_clip_router)
 # Public privacy page (linked from the store listings).
 from privacy import router as privacy_router
 app.include_router(privacy_router)
+
+# Public support page (store listings' Support URL).
+from support import router as support_router
+app.include_router(support_router)
