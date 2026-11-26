@@ -215,6 +215,24 @@ def check_rate(client: Client, now=None):
                 raise HTTPException(429, _limit_message(limit, label, retry), headers={'Retry-After': str(retry)})
 
 
+def remaining(client: Client, now=None) -> dict:
+    """How many analyses this install has left this hour and today (the tighter of its own and its IP's caps).
+    Read-only; lets the app show "5 analyses left this hour" before upload instead of a surprise 429."""
+    now = now or time.time()
+    with _lock:
+        out = {}
+        for label, window, own, ip_cap in (('hour', HOUR_S, cfg('hour_limit'), cfg('ip_hour_limit')),
+                                           ('day', DAY_S, cfg('day_limit'), cfg('ip_day_limit'))):
+            lefts = []
+            if own:
+                lefts.append(max(0, own - _count_hits(f'install:{client.install_id}', window, now)))
+            if ip_cap:
+                lefts.append(max(0, ip_cap - _count_hits(f'ip:{client.ip}', window, now)))
+            out[f'{label}_limit'] = own or None
+            out[f'{label}_left'] = min(lefts) if lefts else None
+        return out
+
+
 def record_analysis(client: Client, now=None):
     now = now or time.time()
     with _lock:

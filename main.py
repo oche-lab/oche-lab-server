@@ -22,7 +22,7 @@ from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 import guard
 
-VERSION = '0.9.5'
+VERSION = '0.9.6'
 log = logging.getLogger('oche.detect')
 logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
@@ -357,7 +357,14 @@ def open_in_expo_go():
 
 @app.get('/health')
 def health():
-    return {'ok':True, 'version':VERSION, 'views':list(VIEWS), 'features':['job_progress', 'mechanics', 'mechanics_detail', 'queue_position', 'job_retry', 'install_id']}
+    return {'ok':True, 'version':VERSION, 'views':list(VIEWS), 'features':['job_progress', 'mechanics', 'mechanics_detail', 'queue_position', 'job_retry', 'install_id', 'limits']}
+
+
+@app.get('/limits')
+def limits(request: Request):
+    """Analyses left for this install this hour and today, so the app can show them near Record."""
+    client = guard.authorize(request)
+    return guard.remaining(client)
 
 
 @app.get('/analysis/{analysis_id}/frames/{name}')

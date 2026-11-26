@@ -23,6 +23,7 @@ Hosted on Render (free web service, Docker). The container listens on `$PORT` (d
 - `GET /health`
 - `POST /analyse` (multipart: `video`, `arm`=right|left, `overlay`=true|false, `mode`=sync|job)
 - `GET /jobs/{id}`: poll a `mode=job` analysis (includes `queue_position` while queued)
+- `GET /limits`: analyses left for this install this hour and today (`hour_left`, `day_left`, `hour_limit`, `day_limit`); read-only
 - `GET /analysis/{id}/frames/{name}` and `/analysis/{id}/overlay.mp4`: generated media
 
 `POST /analyse` and `GET /jobs/{id}` expect an `X-Install-Id` header (a per-install random id from the app).
@@ -30,6 +31,9 @@ If the server is configured with `OCHELAB_APP_KEY`, they also expect `X-Oche-App
 are accepted during a short rollout window (`OCHELAB_ALLOW_LEGACY=1`, the default). Analyses are rate
 limited per install and per IP. If the process restarts mid-job, `GET /jobs/{id}` returns HTTP 410 so
 the app can resubmit automatically.
+
+The app pings `/health` when the player opens Analyse, so the free Render instance is usually awake by
+the time a clip is uploaded.
 
 Uploaded videos are deleted after analysis; generated results are cleaned up automatically and kept
 within a disk budget on small hosts.
