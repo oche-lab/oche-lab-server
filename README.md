@@ -23,6 +23,7 @@ Hosted on Render (free web service, Docker). The container listens on `$PORT` (d
 - `GET /health`
 - `POST /analyse` (multipart: `video`, `arm`=right|left, `overlay`=true|false, `mode`=sync|job)
 - `GET /jobs/{id}`: poll a `mode=job` analysis (includes `queue_position` while queued)
+- `GET /privacy`: the public privacy page linked from the store listings
 - `GET /limits`: analyses left for this install this hour and today (`hour_left`, `day_left`, `hour_limit`, `day_limit`); read-only
 - `GET /analysis/{id}/frames/{name}` and `/analysis/{id}/overlay.mp4`: generated media
 

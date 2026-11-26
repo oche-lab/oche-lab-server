@@ -22,7 +22,7 @@ from analysis import (TIPS_NOTE, body_frame, build_review, front_metrics, front_
 from annotate import open_video, render_key_frames, render_overlay_video, upright
 import guard
 
-VERSION = '0.9.6'
+VERSION = '0.9.7'
 log = logging.getLogger('oche.detect')
 logging.basicConfig(level=logging.INFO)
 VIEWS = ('side', 'front')   # camera angle: side-on (default) or front-on
@@ -581,3 +581,7 @@ def get_job(job_id: str, request: Request):
 # Share clips are a separate module so they can land beside other server work.
 from shareclip import router as share_clip_router
 app.include_router(share_clip_router)
+
+# Public privacy page (linked from the store listings).
+from privacy import router as privacy_router
+app.include_router(privacy_router)
