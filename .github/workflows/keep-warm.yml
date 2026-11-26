@@ -1,0 +1,23 @@
+# Free keep-warm for the Render free instance (audit R25, option A).
+# Render's free web services sleep after ~15 idle minutes and take up to a minute to wake. A GitHub Actions ping every
+# 10 minutes during UK daytime keeps the first analysis fast. Public-repo Actions minutes are free; about 16 h/day of
+# uptime stays inside Render's 750 free instance-hours a month. Overnight the server still sleeps.
+# Note: GitHub pauses scheduled workflows after 60 days without repo activity; re-enable it from the Actions tab.
+name: keep-warm
+on:
+  schedule:
+    - cron: '*/10 7-22 * * *'   # UTC; 07:00–23:00 UK in winter, 08:00–00:00 in summer
+  workflow_dispatch: {}
+permissions: {}
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping /health
+        run: |
+          for i in 1 2 3; do
+            if curl -fsS --max-time 90 https://oche-lab-api.onrender.com/health; then exit 0; fi
+            sleep 10
+          done
+          echo "health ping failed (server may be deploying)"; exit 0
